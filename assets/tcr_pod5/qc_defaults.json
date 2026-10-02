@@ -22,5 +22,13 @@
   "primer_errors": 3,
   "primer_window": 150,
   "max_overtrim": 5,
-  "homopolymer_length": 5
+  "homopolymer_length": 5,
+  "target_min_reads": 50,
+  "target_min_wells": 2,
+  "target_min_reads_per_well": 5,
+  "target_min_each_strand": 5,
+  "target_min_alignment_length": 3000,
+  "target_min_query_coverage": 0.95,
+  "target_boundary_tolerance": 75,
+  "target_min_cluster_fraction": 0.8
 }

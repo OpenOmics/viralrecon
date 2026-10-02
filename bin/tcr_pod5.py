@@ -20,6 +20,8 @@ import subprocess
 import sys
 from collections import Counter, defaultdict
 
+from tcr_pod5_targets import Endpoint, infer_targets, load_intervals, target_candidate
+
 from tcr_pod5_core import (VERSION, Settings, Sam, assign, build_scheme, evidence,
                             full_primer_match, rc, read_fasta, screen, write_fasta)
 
@@ -149,14 +151,15 @@ def cmd_audit(a):
 
 
 def cmd_prepare(a):
-    pairs = build_scheme(a.primers, a.references, a.targets, a.outdir,
-                         a.expected_pairs, a.barcode_errors)
+    expected = [x.strip() for x in a.expected_constructs.split(";")] if a.expected_constructs else None
+    pairs = build_scheme(a.primers, a.references, a.outdir,
+                         a.expected_pairs, a.barcode_errors, expected)
     out = Path(a.outdir)
-    for name, file in (("primers", a.primers), ("references", a.references), ("targets", a.targets)):
+    for name, file in (("primers", a.primers), ("references", a.references)):
         shutil.copy2(file, out / ("input_" + name + Path(file).suffix))
     dump(out / "input_checksums.json", {
         str(file): hashlib.sha256(Path(file).read_bytes()).hexdigest()
-        for file in (a.primers, a.references, a.targets)
+        for file in (a.primers, a.references)
     })
     print(f"Prepared {len(pairs)} legal well pairs", file=sys.stderr)
 
@@ -356,9 +359,58 @@ def cmd_align(a):
     run([a.samtools, "sort", "-n", "-@", a.threads, "-o", "name_sorted.bam", "aligned.bam"])
 
 
+def cmd_infer_targets(a):
+    cfg = Settings.from_json(a.settings)
+    refs = read_fasta(a.references)
+    manifest = json.loads(Path(a.manifest).read_text())
+    if manifest["batch"] != a.batch:
+        raise ValueError("Inference manifest batch mismatch")
+    seen, wells, points, excluded, assigned = set(), set(), [], Counter(), Counter()
+    for item in sorted(manifest["alignments"], key=lambda item: item["well"]):
+        well = item["well"]
+        if well in wells:
+            raise ValueError(f"Repeated well in target inference: {well}")
+        wells.add(well)
+        for name, records in itertools.groupby(alignments(item["bam"], a.samtools), key=lambda r: r.name):
+            if name in seen:
+                raise ValueError(f"Repeated read UUID across batch alignments: {name}")
+            seen.add(name)
+            status, chosen = assign(list(records), refs, cfg, require_target_coverage=False)
+            if chosen is None:
+                excluded[status] += 1
+                continue
+            assigned[status] += 1
+            reason = target_candidate(chosen, cfg)
+            if reason:
+                excluded[reason] += 1
+                continue
+            points.append(Endpoint(name, well, chosen.ref, chosen.start, chosen.end, chosen.strand))
+    report, used = infer_targets(refs, points, cfg, a.batch, manifest.get("expected_constructs"))
+    report.update(input_reads=len(seen), input_wells=len(wells),
+                  competitive_assignments=dict(assigned), excluded_reads=dict(excluded))
+    out = Path(a.outdir)
+    out.mkdir(parents=True, exist_ok=False)
+    dump(out / "inferred_targets.json", report)
+    with open(out / "inferred_targets.bed", "w") as bed, open(out / "target_summary.tsv", "w") as table:
+        fields = ["reference", "status", "consensus_eligible", "start", "end", "candidate_reads",
+                  "candidate_wells", "supporting_reads", "supporting_wells", "balanced_cluster_fraction", "reason"]
+        writer = csv.DictWriter(table, fieldnames=fields, delimiter="\t", extrasaction="ignore")
+        writer.writeheader()
+        for name, row in sorted(report["references"].items()):
+            writer.writerow(row)
+            if row["status"] == "INFERRED":
+                bed.write(f"{name}\t{row['start']}\t{row['end']}\t{name}\n")
+    with open(out / "boundary_evidence.tsv", "w") as table:
+        table.write("read_id\twell\treference\tstart\tend\tstrand\tsupports_inferred_target\n")
+        for row in sorted(points, key=lambda row: (row.reference, row.well, row.read_id)):
+            table.write(f"{row.read_id}\t{row.well}\t{row.reference}\t{row.start}\t{row.end}\t{row.strand}\t{int(row.read_id in used)}\n")
+
+
 def cmd_qc(a):
     cfg = Settings.from_json(a.settings)
     refs = read_fasta(a.references)
+    target_report = json.loads(Path(a.inferred_targets).read_text())
+    targets = load_intervals(target_report, refs, a.batch)
     counts, good, seen = Counter(), [], set()
     Path("qc").mkdir()
     with open("qc/read_assignments.tsv", "w") as table:
@@ -367,7 +419,7 @@ def cmd_qc(a):
             if name in seen:
                 raise ValueError("QC requires a query-name sorted BAM; repeated nonconsecutive read ID")
             seen.add(name)
-            status, chosen = assign(list(records), refs, cfg)
+            status, chosen = assign(list(records), refs, cfg, require_target_coverage=False)
             counts[status] += 1
             if chosen:
                 good.append(chosen)
@@ -375,8 +427,10 @@ def cmd_qc(a):
     trim = json.loads(Path(a.trim_stats).read_text())
     if sum(counts.values()) != trim["passed_reads"]:
         raise ValueError("Alignment/trimmed read accounting mismatch")
-    report, ev, selected = screen(list(counts.elements()), good, refs, cfg, trim)
-    report.update(sample=a.sample, batch=a.batch, well=a.well, trim_stats=trim)
+    report, ev, selected = screen(list(counts.elements()), good, refs, cfg, trim,
+                                  targets=targets, expected_constructs=target_report["expected_constructs"])
+    report.update(sample=a.sample, batch=a.batch, well=a.well, trim_stats=trim,
+                  target_inference=target_report["references"][report["dominant_construct"]])
     dump("qc/decision.json", report)
     with open("qc/allele_support.tsv", "w") as table:
         table.write("kind\tposition_0based\thomopolymer\tallele_counts\n")
@@ -480,6 +534,9 @@ def cmd_polish(a):
 def cmd_report(a):
     data = json.loads(Path(a.manifest).read_text())
     rows, seqs = [], {}
+    target_reports = [json.loads(Path(d, "inferred_targets.json").read_text()) for d in data.get("target_dirs", [])]
+    if len({r["batch"] for r in target_reports}) != len(target_reports):
+        raise ValueError("Duplicate batch target reports")
     qc = {json.loads(Path(p, "decision.json").read_text())["sample"]: p for p in data["qc_dirs"]}
     pol = {json.loads(Path(p, "decision.json").read_text())["sample"]: p for p in data["polish_dirs"]}
     for d in data["demux_dirs"]:
@@ -489,14 +546,17 @@ def cmd_report(a):
             sample = f"{item['batch']}__{item['well']}"
             row = dict(sample=sample, batch=item["batch"], well=item["well"], raw_assigned_reads=item["reads"],
                        status="NO_READS", reasons="No reads classified to this well", dominant_construct="",
-                       usable_reads=0, callable_fraction="")
+                       usable_reads=0, callable_fraction="", target_status="", target_start="", target_end="")
             if item["reads"] and sample not in qc:
                 raise ValueError(f"Missing well QC result: {sample}")
             if sample in qc:
                 q = json.loads(Path(qc[sample], "decision.json").read_text())
                 row.update(status=q["status"], reasons=";".join(q["reasons"]),
                            dominant_construct=q["dominant_construct"], usable_reads=q["assigned_reads"],
-                           callable_fraction=q["callable_fraction"])
+                           callable_fraction=q["callable_fraction"],
+                           target_status=q.get("target_inference", {}).get("status", ""),
+                           target_start=q.get("target_inference", {}).get("start"),
+                           target_end=q.get("target_inference", {}).get("end"))
                 if q["status"] == "PASS_SCREEN" and sample not in pol:
                     raise ValueError(f"Missing consensus result for passing well: {sample}")
             if sample in pol:
@@ -517,6 +577,7 @@ def cmd_report(a):
     write_fasta("accepted_consensus.fasta", dict(sorted(seqs.items())))
     dump("run_summary.json", dict(wells=len(rows), accepted_consensuses=len(seqs),
           statuses=dict(Counter(r["status"] for r in rows)), implementation_version=VERSION,
+          batch_targets={r["batch"]: r for r in sorted(target_reports, key=lambda x: x["batch"])},
           note="Exploratory mixture screening. PASS does not establish one physical template."))
     print(f"Completed: {len(rows)} wells, {len(seqs)} accepted consensus sequences", file=sys.stderr)
 
@@ -528,8 +589,10 @@ def main():
     audit.add_argument("--manifest", required=True)
     audit.add_argument("--allow-empty", action="store_true")
     prep = sub.add_parser("prepare")
-    for flag in ("primers", "references", "targets", "outdir"):
+    for flag in ("primers", "references", "outdir"):
         prep.add_argument("--" + flag, required=True)
+    prep.add_argument("--expected-constructs", default="",
+                      help="Semicolon-separated FASTA IDs eligible for consensus; omitted means all")
     prep.add_argument("--expected-pairs", type=int, default=48)
     prep.add_argument("--barcode-errors", type=int, default=1)
     base = sub.add_parser("basecall")
@@ -545,7 +608,11 @@ def main():
     aln = sub.add_parser("align")
     for flag in ("bam", "references"):
         aln.add_argument("--" + flag, required=True)
+    inf = sub.add_parser("infer-targets")
+    for flag in ("manifest", "references", "settings", "batch", "outdir"):
+        inf.add_argument("--" + flag, required=True)
     qc = sub.add_parser("qc")
+    qc.add_argument("--inferred-targets", required=True)
     for flag in ("bam", "references", "settings", "trim-stats", "sample", "batch", "well"):
         qc.add_argument("--" + flag, required=True)
     pol = sub.add_parser("polish")
@@ -557,12 +624,12 @@ def main():
     for tool in (base, demux, trim, aln, pol):
         tool.add_argument("--dorado", default="dorado")
         tool.add_argument("--version", default="2.1.2")
-    for tool in (base, demux, trim, aln, qc, pol):
+    for tool in (base, demux, trim, aln, qc, pol, inf):
         tool.add_argument("--samtools", default="samtools")
         tool.add_argument("--threads", default="4")
     a = p.parse_args()
     try:
-        globals()["cmd_" + a.command](a)
+        globals()["cmd_" + a.command.replace("-", "_")](a)
     except (ValueError, OSError, RuntimeError, subprocess.CalledProcessError) as e:
         p.exit(1, f"ERROR: {e}\n")
 

@@ -16,7 +16,7 @@ from itertools import combinations
 from pathlib import Path
 from typing import Iterable
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 DNA = set("ACGT")
 WELL = re.compile(r"[A-H](?:[1-9]|1[0-2])$")
 SAFE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*$")
@@ -154,7 +154,7 @@ def parse_primers(path, expected_pairs=48):
     return pairs
 
 
-def build_scheme(primers, refs, bed, outdir, expected_pairs=48, barcode_errors=1):
+def build_scheme(primers, refs, outdir, expected_pairs=48, barcode_errors=1, expected_constructs=None):
     out = Path(outdir)
     out.mkdir(parents=True, exist_ok=False)
     (out / "primers").mkdir()
@@ -205,33 +205,22 @@ midstrand_flank_score = 0.95
         })
     write_fasta(out / "barcodes.fasta", bcseqs)
     records = read_fasta(refs)
-    targets, regions = {}, []
-    with open(bed) as fbed:
-        for line in fbed:
-            if not line.strip() or line.startswith("#"):
-                continue
-            fields = line.rstrip().split("\t")
-            if len(fields) != 4:
-                raise ValueError("Targets BED requires exactly: reference_id, start, end, construct_id")
-            name, s, e, construct = fields
-            start, end = int(s), int(e)
-            if name not in records or not (0 <= start < end <= len(records[name])):
-                raise ValueError(f"Invalid BED interval: {line.strip()}")
-            if not SAFE.fullmatch(construct) or construct in targets:
-                raise ValueError(f"Invalid or duplicate construct ID: {construct}")
-            targets[construct] = records[name][start:end]
-            regions.append(dict(construct=construct, reference=name, start=start, end=end))
-    if not targets:
-        raise ValueError("No amplicon interiors in targets BED")
-    if len(targets) > 50:
+    if len(records) > 50:
         raise ValueError("This implementation supports at most 50 competing TCR constructs")
-    if len(set(targets.values())) != len(targets):
-        raise ValueError("Reference panel contains identical amplicon sequences; assignment is not identifiable")
-    write_fasta(out / "amplicons.fasta", targets)
+    if any(not SAFE.fullmatch(name) for name in records):
+        raise ValueError("Reference FASTA IDs must contain only letters, digits, underscores, periods and hyphens")
+    if len(set(records.values())) != len(records):
+        raise ValueError("Reference panel contains identical sequences; assignment is not identifiable")
+    expected = sorted(records if expected_constructs is None else expected_constructs)
+    if not expected or len(set(expected)) != len(expected) or set(expected) - set(records):
+        raise ValueError("expected_constructs must be a nonempty, unique subset of reference FASTA IDs")
+    # Preserve ALL full reference sequences, including contamination sentinels.
+    write_fasta(out / "reference.fasta", records)
     (out / "scheme.json").write_text(json.dumps({
         "pairs": pairs, "index_coordinates": "1-based inclusive",
         "index_min_edit_distances": distances,
-        "regions": regions, "version": VERSION,
+        "expected_constructs": expected, "reference_lengths": {k: len(v) for k, v in records.items()},
+        "reference_mode": "full_panel", "version": VERSION,
         "threshold_status": "exploratory, not assay-validated"
     }, indent=2) + "\n")
     with open(out / "well_map.tsv", "w") as ftable:
@@ -267,6 +256,14 @@ class Settings:
     primer_window: int = 150
     max_overtrim: int = 5
     homopolymer_length: int = 5
+    target_min_reads: int = 50
+    target_min_wells: int = 2
+    target_min_reads_per_well: int = 5
+    target_min_each_strand: int = 5
+    target_min_alignment_length: int = 3000
+    target_min_query_coverage: float = 0.95
+    target_boundary_tolerance: int = 75
+    target_min_cluster_fraction: float = 0.80
 
     @classmethod
     def from_json(cls, path):
@@ -276,19 +273,26 @@ class Settings:
             raise ValueError(f"Unknown QC options: {sorted(unknown)}")
         obj = cls(**raw)
         for key, value in asdict(obj).items():
-            if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
+            if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) or value < 0:
                 raise ValueError(f"Invalid numeric QC option {key}={value}")
             if isinstance(getattr(cls(), key), int) and not isinstance(value, int):
                 raise ValueError(f"QC option {key} must be an integer")
         for key in ("min_identity", "min_query_coverage", "min_target_coverage", "minor_fraction",
                     "alert_fraction", "max_unresolved_fraction", "max_trim_fail_fraction",
-                    "consensus_fraction", "min_callable_fraction"):
+                    "consensus_fraction", "min_callable_fraction", "target_min_query_coverage",
+                    "target_min_cluster_fraction"):
             if not 0 < getattr(obj, key) <= 1:
                 raise ValueError(f"QC option {key} must be in (0,1]")
         if not obj.alert_fraction < obj.minor_fraction <= 0.5:
             raise ValueError("Require alert_fraction < minor_fraction <= 0.5")
         if obj.consensus_fraction <= 0.5 or obj.min_reads < 1 or obj.min_depth < 1:
             raise ValueError("Invalid consensus or support thresholds")
+        for key in ("target_min_reads", "target_min_wells", "target_min_reads_per_well",
+                    "target_min_each_strand", "target_min_alignment_length", "target_boundary_tolerance"):
+            if getattr(obj, key) < 1:
+                raise ValueError(f"QC option {key} must be positive")
+        if obj.target_min_cluster_fraction <= 0.5:
+            raise ValueError("target_min_cluster_fraction must be greater than 0.5")
         return obj
 
 
@@ -343,7 +347,7 @@ def mean_q(qual):
     return -10 * math.log10(sum(10 ** (-(ord(c) - 33) / 10) for c in qual) / len(qual))
 
 
-def assign(records: list[Sam], refs: dict[str, str], cfg: Settings):
+def assign(records: list[Sam], refs: dict[str, str], cfg: Settings, require_target_coverage=True):
     primary = [r for r in records if not r.flag & (256 | 2048)]
     if len(primary) != 1:
         raise ValueError(f"Expected one primary alignment per read: {records[0].name}")
@@ -352,10 +356,12 @@ def assign(records: list[Sam], refs: dict[str, str], cfg: Settings):
         return "unmapped", None
     if r.ref not in refs:
         raise ValueError(f"Unexpected reference in SAM: {r.ref}")
-    if any(x.flag & 2048 for x in records):
+    if any(x.flag & 2048 for x in records) or "SA" in r.tags:
         return "split_alignment", None
     if mean_q(r.qual) < cfg.min_read_q:
         return "low_read_quality", None
+    if "H" in r.cigar:
+        return "partial_read", None
     if "N" in r.cigar:
         return "split_alignment", None
     aligned = sum(n for n, op in r.ops if op in "MI=X")
@@ -365,12 +371,12 @@ def assign(records: list[Sam], refs: dict[str, str], cfg: Settings):
         return "low_identity", None
     if aligned / max(1, len(r.seq)) < cfg.min_query_coverage:
         return "partial_read", None
-    if (r.end - r.start) / len(refs[r.ref]) < cfg.min_target_coverage:
+    if require_target_coverage and (r.end - r.start) / len(refs[r.ref]) < cfg.min_target_coverage:
         return "partial_target", None
     alt = [int(x.tags.get("AS", -10**9)) for x in records
            if x.ref != r.ref and not x.flag & (4 | 2048)]
     gap = int(r.tags.get("AS", -10**9)) - max(alt) if alt else 10**9
-    if r.mapq < cfg.min_mapq or gap < cfg.score_gap:
+    if r.mapq == 255 or r.mapq < cfg.min_mapq or gap < cfg.score_gap:
         return "ambiguous_reference", None
     return r.ref, r
 
@@ -426,12 +432,20 @@ def low_complexity(ref, pos, n):
     return any(base * n in s for base in DNA)
 
 
-def evidence(reads: list[Sam], ref: str, cfg: Settings):
+def evidence(reads: list[Sam], ref: str, cfg: Settings, interval=None):
+    """Evaluate bases in a fixed target interval; report original-reference coordinates."""
+    start, end = interval if interval is not None else (0, len(ref))
+    if not 0 <= start < end <= len(ref):
+        raise ValueError("Invalid evidence interval")
     obs, evs, strands = {}, {}, {}
     pile = defaultdict(dict)
     all_events = set()
     for r in reads:
         b, e = observations(r, ref, cfg)
+        if interval is not None:
+            b = {pos: base for pos, base in b.items() if start <= pos < end}
+            e = {event: yes for event, yes in e.items()
+                 if (start <= event[1] and event[1] + (len(event[2]) if event[0] == "D" else 1) < end)}
         obs[r.name], evs[r.name], strands[r.name] = b, e, r.strand
         all_events.update(e)
         for pos, base in b.items():
@@ -507,7 +521,7 @@ def evidence(reads: list[Sam], ref: str, cfg: Settings):
         conflicts = True
     if -1 in insertions:
         draft.append(insertions[-1])
-    for p in range(len(ref)):
+    for p in range(start, end):
         counts = Counter(pile.get(p, {}).values())
         depth = sum(counts.values())
         base, n = counts.most_common(1)[0] if counts else ("N", 0)
@@ -526,11 +540,12 @@ def evidence(reads: list[Sam], ref: str, cfg: Settings):
         if p in insertions:
             draft.append(insertions[p])
     return dict(sites=sites, links=links, pile=pile, events=event_support,
-                draft="".join(draft), callable_fraction=callable_count / len(ref),
+                draft="".join(draft), callable_fraction=callable_count / (end - start),
                 conflicting_fixed_indels=conflicts, strands=strands)
 
 
-def screen(assignments, assigned_reads, refs, cfg: Settings, trim_stats=None):
+def screen(assignments, assigned_reads, refs, cfg: Settings, trim_stats=None,
+           targets=None, expected_constructs=None):
     """Return (report, evidence, selected reads). Never claim physical template count."""
     counts = Counter(assignments)
     construct_counts = {k: counts.get(k, 0) for k in refs}
@@ -563,15 +578,42 @@ def screen(assignments, assigned_reads, refs, cfg: Settings, trim_stats=None):
         if failed / max(1, n) > cfg.max_trim_fail_fraction:
             reasons.append("REVIEW_PRIMER_TRIMMING")
     selected = [r for r in assigned_reads if r.ref == dominant]
+    target = targets.get(dominant) if targets is not None else (0, len(refs[dominant]))
+    target_partial_reads = 0
+    target_boundary_outlier_reads = 0
+    if expected_constructs is not None and construct_counts[dominant] and dominant not in expected_constructs:
+        reasons.append("REVIEW_UNEXPECTED_CONSTRUCT")
+    if target is None:
+        reasons.append("REVIEW_TARGET_NOT_INFERRED")
+    else:
+        start, end = target
+        if targets is not None:
+            target_boundary_outlier_reads = sum(abs(r.start - start) > cfg.target_boundary_tolerance or
+                                                abs(r.end - end) > cfg.target_boundary_tolerance for r in selected)
+            if target_boundary_outlier_reads / max(1, len(selected)) > cfg.max_unresolved_fraction:
+                reasons.append("REVIEW_TARGET_BOUNDARIES")
+        complete = [r for r in selected
+                    if max(0, min(end, r.end) - max(start, r.start)) / (end - start) >= cfg.min_target_coverage]
+        target_partial_reads = len(selected) - len(complete)
+        # Keep these reads in reference-assignment counts; only exclude from the draft.
+        if target_partial_reads / max(1, len(selected)) > cfg.max_unresolved_fraction:
+            reasons.append("REVIEW_PARTIAL_TARGET_READS")
+        selected = complete
+        if len(selected) < cfg.min_reads:
+            reasons.append("LOW_TARGET_SUPPORT")
     strands = Counter(r.strand for r in selected)
     if min(strands.get("+", 0), strands.get("-", 0)) < cfg.min_strand_reads:
         reasons.append("REVIEW_STRAND_SUPPORT")
-    ev = evidence(selected, refs[dominant], cfg)
+    if target is None:
+        ev = dict(sites=[], links=[], pile={}, events=[], draft="", callable_fraction=None,
+                  conflicting_fixed_indels=False, strands=dict(strands))
+    else:
+        ev = evidence(selected, refs[dominant], cfg, target)
     if ev["links"]:
         reasons.append("REJECT_LINKED_HAPLOTYPES")
     elif ev["sites"]:
         reasons.append("REVIEW_WITHIN_CONSTRUCT_VARIATION")
-    if ev["callable_fraction"] < cfg.min_callable_fraction:
+    if ev["callable_fraction"] is not None and ev["callable_fraction"] < cfg.min_callable_fraction:
         reasons.append("REVIEW_INCOMPLETE_COVERAGE")
     if ev["conflicting_fixed_indels"]:
         reasons.append("REVIEW_CONFLICTING_INDELS")
@@ -586,6 +628,11 @@ def screen(assignments, assigned_reads, refs, cfg: Settings, trim_stats=None):
                   unresolved_counts={k: v for k, v in counts.items() if k not in refs},
                   strand_counts=dict(strands), callable_fraction=ev["callable_fraction"],
                   candidate_sites=len(ev["sites"]), linked_haplotypes=ev["links"],
+                  target_interval=list(target) if target is not None else None,
+                  target_partial_reads=target_partial_reads,
+                  target_boundary_outlier_reads=target_boundary_outlier_reads,
+                  evidence_coordinates="original reference, 0-based; draft spans target_interval",
+                  expected_constructs=sorted(expected_constructs) if expected_constructs is not None else None,
                   settings=asdict(cfg), software_version=VERSION,
                   interpretation="No detected mixture above this screen's thresholds is not proof of one original molecule.")
     return report, ev, selected

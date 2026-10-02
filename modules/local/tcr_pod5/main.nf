@@ -30,16 +30,17 @@ process TCR_POD5_AUDIT {
 process TCR_PREPARE {
     tag "${meta.id}"
     label 'tcr_cpu'
-    publishDir { "${params.outdir}/tcr_pod5/${meta.id}/scheme" }, mode: 'copy', pattern: 'scheme/*'
+    publishDir { "${params.outdir}/tcr_pod5/${meta.id}/scheme" }, mode: 'copy', pattern: 'scheme'
     input:
-    tuple val(meta), path(primers), path(refs), path(bed)
+    tuple val(meta), path(primers), path(refs)
     path tooling
     output:
     tuple val(meta), path('scheme'), emit: scheme
     script:
     """
     python3 tcr_pod5.py prepare \\
-      --primers ${tq(primers)} --references ${tq(refs)} --targets ${tq(bed)} \\
+      --primers ${tq(primers)} --references ${tq(refs)} \\
+      --expected-constructs ${tq(meta.expected_constructs.join(';'))} \\
       --expected-pairs ${params.tcr_expected_pairs} --barcode-errors ${params.tcr_barcode_errors} \\
       --outdir scheme
     """
@@ -129,12 +130,37 @@ process TCR_ALIGN {
     """
 }
 
+
+process TCR_INFER_TARGETS {
+    tag "${meta.id}"
+    label 'tcr_cpu'
+    publishDir { "${params.outdir}/tcr_pod5/${meta.id}/target_inference" }, mode: 'copy', pattern: 'targets'
+    input:
+    tuple val(meta), path(scheme), val(wells), path(bams, stageAs: 'well_bams??/*')
+    path settings
+    path tooling
+    output:
+    tuple val(meta), path('targets'), emit: result
+    script:
+    def paths = bams instanceof List ? bams : (bams ? [bams] : [])
+    def entries = wells.withIndex().collect { well, i -> [well: well, bam: paths[i].toString()] }
+    def payload = [batch: meta.id, expected_constructs: (meta.expected_constructs ?: null), alignments: entries]
+    """
+    cat > inference_inputs.json <<'TCR_PAYLOAD'
+    ${JsonOutput.toJson(payload)}
+    TCR_PAYLOAD
+    python3 tcr_pod5.py infer-targets --manifest inference_inputs.json \\
+      --batch ${tq(meta.id)} --references ${tq(scheme.resolve('reference.fasta'))} \\
+      --settings ${tq(settings)} --samtools ${tq(params.tcr_samtools_bin)} --outdir targets
+    """
+}
+
 process TCR_WELL_QC {
     tag "${meta.id}"
     label 'tcr_cpu'
     publishDir { "${params.outdir}/tcr_pod5/${meta.batch}/wells/${meta.well}/heterogeneity" }, mode: 'copy', pattern: 'qc'
     input:
-    tuple val(meta), path(bam), path(refs), path(trim_stats), path(clean)
+    tuple val(meta), path(bam), path(refs), path(trim_stats), path(clean), path(targets)
     path settings
     path tooling
     output:
@@ -144,6 +170,7 @@ process TCR_WELL_QC {
     """
     python3 tcr_pod5.py qc --bam ${tq(bam)} --references ${tq(refs)} \\
       --settings ${tq(settings)} --trim-stats ${tq(trim_stats)} \\
+      --inferred-targets ${tq(targets.resolve('inferred_targets.json'))} \\
       --sample ${tq(meta.id)} --batch ${tq(meta.batch)} --well ${tq(meta.well)} \\
       --samtools ${tq(params.tcr_samtools_bin)} --threads ${task.cpus}
     """
@@ -176,6 +203,7 @@ process TCR_REPORT {
     path demux_dirs, stageAs: 'demux_input??/*'
     path qc_dirs, stageAs: 'qc_input??/*'
     path polish_dirs, stageAs: 'polish_input??/*'
+    path target_dirs, stageAs: 'targets_input??/*'
     path tooling
     output:
     path 'well_summary.tsv', emit: table
@@ -183,7 +211,7 @@ process TCR_REPORT {
     path 'run_summary.json', emit: json
     script:
     def asStrings = { v -> (v instanceof List ? v : (v ? [v] : [])).collect { it.toString() } }
-    def payload = [demux_dirs: asStrings(demux_dirs), qc_dirs: asStrings(qc_dirs), polish_dirs: asStrings(polish_dirs)]
+    def payload = [demux_dirs: asStrings(demux_dirs), qc_dirs: asStrings(qc_dirs), polish_dirs: asStrings(polish_dirs), target_dirs: asStrings(target_dirs)]
     """
     cat > report_inputs.json <<'TCR_PAYLOAD'
     ${JsonOutput.toJson(payload)}
