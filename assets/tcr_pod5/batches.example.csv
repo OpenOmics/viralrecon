@@ -1,0 +1,3 @@
+batch,pod5_dir,primer_table,sequencing_kit,basecall_model,reference_fasta,expected_constructs
+batch_run1,/data/project/input/run1/pod5,/data/project/input/run1/primers.tsv,SQK-LSK114,/data/models/REPLACE_WITH_COMPATIBLE_VERSIONED_MODEL,/data/project/references/all_TCR_reference.fasta,PID201588_APC;PID201588_PIK3CA
+batch_run2,/data/project/input/run2/pod5,/data/project/input/run2/primers.tsv,SQK-LSK114,/data/models/REPLACE_WITH_COMPATIBLE_VERSIONED_MODEL,/data/project/references/all_TCR_reference.fasta,PID201588_APC;PID201588_PIK3CA

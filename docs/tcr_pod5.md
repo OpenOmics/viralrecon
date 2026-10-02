@@ -1,14 +1,8 @@
 # POD5-first TCR analysis extension for nf-core/viralrecon
 
-**Status:** implemented development prototype; not assay-validated or end-to-end runtime-tested. The supplied tests report **50 passed and 1 skipped**. Dorado, samtools, GPU basecalling, and Nextflow execution were unavailable in the build environment. Read `validation/VALIDATION.md` before running patient-derived data.
+**Status:** development prototype, not an assay-validated pipeline. The BED-free update has **91 passing Python tests and 1 skipped external-tool test**. These include synthetic SAM-to-inference-to-QC integration tests, not a Nextflow/Dorado/GPU end-to-end run. See [validation and migration notes](tcr_pod5_target_inference.md).
 
-This package installs a separate, opt-in **POD5-only TCR workflow** into a clean checkout of `nf-core/viralrecon` pinned to:
-
-```
-fa23078485cb75e96add952045b2b897aab61b42
-```
-
-It supersedes the earlier FASTQ/Cutadapt integration. It is a local extension, not an official nf-core release or a submitted GitHub change. The installer retains the original viralrecon entry source alongside the new dispatcher. The stock branch has not been regression-tested after installation.
+This is the opt-in, POD5-only TCR path in the `OpenOmics/viralrecon` `tcr-pod5` branch, originally based on upstream commit `fa23078485cb75e96add952045b2b897aab61b42`. Stock workflows remain separate. No stock Nextflow regression run was performed for this update.
 
 ## 1. Implemented workflow
 
@@ -20,7 +14,10 @@ POD5 files grouped by supplied batch
        (both ends required; unclassified reads retained)
     -> per-well Dorado custom primer trimming and boundary validation
     -> per-well BAM + FASTQ
-    -> competitive alignment to expected TCR amplicon references
+    -> competitive alignment to ALL full TCR references
+    -> pool qualifying alignments across wells within each batch
+    -> infer shared, reference-specific amplicon intervals
+       (inferred_targets.bed is an OUTPUT, not an input)
     -> within-well heterogeneity screen
          REJECT / REVIEW -> no consensus; retain evidence and reads
          PASS_SCREEN     -> read-supported draft
@@ -29,28 +26,21 @@ POD5 files grouped by supplied batch
                              -> masked consensus only if final checks pass
 ```
 
-For PID201588, the expected construct panel should contain both **APC and PIK3CA**. Each batch/well is a separate analysis unit, for example `preinfusion_201588_run1__A1`. Acquisitions are not equated to biological wells. Batch boundaries remain explicit even if acquisition IDs appear in more than one directory.
+For PID201588, the expected constructs are **APC and PIK3CA**. The competitive panel can also include PID201403 and PID202478 as contamination sentinels. Use `expected_constructs` to declare which FASTA IDs are eligible for consensus; all records remain available for mapping. Each batch/well is a separate analysis unit, for example `preinfusion_201588_run1__A1`. Acquisitions are not equated to biological wells. Batch boundaries remain explicit even if acquisition IDs appear in more than one directory.
 
 This branch bypasses ARTIC, Guppyplex, viral lineage analysis, and the old Cutadapt demultiplexer. It does not claim that a consensus or tree proves a well began with one physical molecule. Its interpretation is **no detectable mixture above the configured thresholds**.
 
 ## 2. Installation and software
 
-Use a fresh checkout, not the previously FASTQ-patched working tree:
+Use the updated branch directly (do not reapply the old package installer):
 
 ```bash
-git clone https://github.com/nf-core/viralrecon.git viralrecon-pod5
-cd viralrecon-pod5
-git checkout fa23078485cb75e96add952045b2b897aab61b42
-cd ..
-
-python3 viralrecon_tcr_pod5/apply.py viralrecon-pod5 --check-only
-python3 viralrecon_tcr_pod5/apply.py viralrecon-pod5
-
-git -C viralrecon-pod5 diff --stat
-git -C viralrecon-pod5 status --short
+git clone --branch tcr-pod5 https://github.com/OpenOmics/viralrecon.git
+cd viralrecon
+git rev-parse HEAD
 ```
 
-The installer checks the commit, a clean working tree, the original `main.nf` blob, and expected schema structure. It refuses to overwrite an existing extension. It changes three root files and adds the workflow, processes, Python helpers, configuration, and documentation. It does not create commits or contact GitHub.
+For an existing clean checkout on `tcr-pod5`, use `git pull --ff-only origin tcr-pod5`. Pin and record the resulting commit for reproducibility.
 
 Runtime requirements:
 
@@ -71,14 +61,16 @@ The `tcr_conda` profile supplies the CPU dependencies, **not Dorado or GPU drive
 Use `--tcr_input`, not the standard viralrecon FASTQ samplesheet. Required CSV columns are:
 
 ```
-batch,pod5_dir,primer_table,sequencing_kit,basecall_model,reference_fasta,targets_bed
+batch,pod5_dir,primer_table,sequencing_kit,basecall_model,reference_fasta
 ```
 
-`examples/batches.csv` shows the two supplied batches. Edit its placeholders before use. Paths are resolved relative to the CSV's directory unless absolute. The current implementation supports local/shared-filesystem paths, not remote object-store URLs. There must be exactly one row per batch; `.pod5` files are discovered recursively under that row's directory.
+`assets/tcr_pod5/batches.example.csv` shows two illustrative batches with an optional `expected_constructs` column. Edit its placeholders before use. Paths are resolved relative to the CSV's directory unless absolute. The current implementation supports local/shared-filesystem paths, not remote object-store URLs. There must be exactly one row per batch; `.pod5` files are discovered recursively under that row's directory.
 
 * `sequencing_kit` is the actual ONT library kit, **not** the custom TCR barcode scheme name. The example uses the previously reported `SQK-LSK114`; the audit checks it against nonblank POD5 metadata.
 * `basecall_model` is a pre-downloaded, versioned simplex model directory containing `config.toml`, not the moving alias `sup`. Select a model compatible with the acquisition and Dorado release. Do not assume the old FASTQ's v4.1.0 model is supported by a new Dorado release.
-* `reference_fasta` contains the expected constructs for that batch. For this patient, combine the APC and PIK3CA reference records with distinct FASTA IDs.
+* `reference_fasta` is the full competitive panel, with unique, safe FASTA IDs. All four supplied constructs can be included; no reference is removed just because its target cannot be inferred.
+* Optional `expected_constructs` is a **semicolon-separated** list of FASTA IDs eligible for consensus, e.g. `PID201588_APC;PID201588_PIK3CA`. Other references are sentinels. A sentinel-dominated well is `REVIEW_UNEXPECTED_CONSTRUCT`, never an accepted consensus. If omitted or empty, all panel members are eligible; the pipeline does not guess biological roles from names.
+* Remove the old `targets_bed` column. A nonempty legacy value is rejected with a migration message rather than silently ignored.
 
 ### Full primer table
 
@@ -88,21 +80,23 @@ Supply the complete TSV for each batch, including:
 Shorthand  Direction  Sequence  I-start  I-end  Pair_with
 ```
 
-The parser expects `fA1` paired with `rA1`, and so on. It interprets `I-start` / `I-end` as **1-based inclusive** index coordinates; `3` and `9` extract seven bases. It validates shared flanking sequences, equal index lengths, unique indexes, and complete pairing. The default expects 48 pairs. The partial reverse-primer list pasted in the conversation is insufficient to run the whole plate.
+The parser expects `fA1` paired with `rA1`, and so on. It interprets `I-start` / `I-end` as **1-based inclusive** index coordinates; `3` and `9` extract seven bases. It validates shared flanking sequences, equal index lengths, unique indexes, and complete pairing. The default expects 48 pairs. A complete table is required; unmatched or missing reverse primers fail validation.
 
 From the table, the pipeline generates the custom Dorado TOML, barcode FASTA, well mapping, and a full-primer FASTA for each well. Rear-primer sequences are supplied in their original oligo orientation; Dorado handles reverse-complement recognition. `Frag-start` / `Frag-end` are not interpreted: their previous software-specific semantics are not established. This workflow intentionally trims the entire indexed PCR primer rather than reproducing an undocumented index-only trimming rule.
 
-### Expected amplicon intervals
+### Automatically inferred amplicon intervals
 
-`targets_bed` must have exactly four **tab-separated** columns:
+You no longer supply a BED. Full-panel alignment happens **before** target inference, without a full-vector target-coverage filter. High-quality, unique primary alignments with no split/SA/hard-clipped evidence are eligible. Inference additionally requires >=3,000 query-aligned bases and >=95% query coverage by default; missing MAPQ (255) is not treated as high confidence.
 
-```
-reference_FASTA_ID    start_0based_inclusive    end_0based_exclusive    construct_ID
-```
+Each batch is handled separately. The algorithm finds a joint start/end cluster using per-well median endpoints as candidate centers, weights wells equally rather than by read count, and uses the median of the supporting per-well medians as its interval. The interval is fixed for all wells in that batch/reference. It does not infer a separate, easier target for each failing well.
 
-Provide one interval per construct, with construct IDs such as `APC` and `PIK3CA`. The interval must be the **expected primer-trimmed amplicon interior**, including any vector sequence genuinely covered by the assay, not the entire supplied vector reference and not merely the TCR coding sequence. This prevents expected unsequenced vector regions from incorrectly failing coverage QC.
+Default acceptance requires 50 supporting reads, at least 2 wells with at least 5 supporting reads each, at least 5 reads on each alignment strand, and 80% well-balanced support within +/-75 bp of both endpoints. All thresholds live in `assets/tcr_pod5/qc_defaults.json` and can be overridden with `--tcr_qc_config`. These are exploratory assay-specific defaults.
 
-The pipeline crops a local reference panel from these intervals. Verify the primer binding positions and amplicon boundaries against the actual reference records. `examples/targets.template.bed` contains format guidance only; no biological coordinates have been invented.
+Unsupported or unstable references receive explicit statuses and no BED interval. Assignment still counts reads supporting those references, so a low-support contaminant cannot disappear from mixture screening. A dominant construct lacking an inferred interval is held for review. There is **no full-vector fallback**.
+
+The inferred BED/JSON/TSV and per-read boundary evidence are published under `<batch>/target_inference/targets/`. The JSON ties each interval to its batch, reference sequence digest, settings, support and strand counts. A batch with no demultiplexed reads still gets a target report for every panel member.
+
+**Limits:** estimates are not independent proof of the complete PCR product. Systematic truncation, shared deletions, or a biased set of input wells can affect them. The default assumes one linear amplicon population per construct and is not designed for tiled or circular-origin-spanning amplicons. Inspect the inference report and validate with assay documentation/controls before interpreting production results. Historical PAF endpoints computed without base-level alignment are comparison material, not hard-coded boundaries.
 
 ## 4. Running
 
@@ -121,7 +115,7 @@ nextflow run /path/to/viralrecon-pod5 \
   -resume
 ```
 
-Replace the paths and site configuration. `examples/slurm.config` is a template with explicit partition placeholders; it is not a verified NIH cluster configuration. The `tcr_gpu` label needs a real GPU resource request. Without a scheduler configuration, Nextflow runs locally.
+Replace the paths and site configuration. Provide a site-specific Slurm configuration; GPU allocation remains an explicit site responsibility. The `tcr_gpu` label needs a real GPU resource request. Without a scheduler configuration, Nextflow runs locally.
 
 TCR mode rejects `--input` and `--fastq_dir`. FASTQs are outputs only. Keep the existing FASTQ-based patch in a separate checkout for comparison, not layered beneath this one.
 
@@ -154,11 +148,11 @@ The seven-base barcode scoring settings are deliberately conservative starting v
 
 ## 6. Heterogeneity and consensus gate
 
-Competitive Dorado/minimap2 alignment retains secondary hits so shared vector or constant-region sequence is not automatically treated as an unambiguous construct assignment. Ambiguous, partial, low-quality, and split alignments are accounted for separately.
+Competitive Dorado/minimap2 alignment against the full reference panel retains secondary hits so shared vector or constant-region sequence is not automatically treated as an unambiguous construct assignment. Ambiguous, partial-query, low-quality, and split alignments are accounted for separately. A target-coverage filter is NOT used to assign references. Once a target has been inferred, target coverage is assessed for draft eligibility without erasing assignment counts. Excess target-incomplete reads or endpoints departing from the batch interval cause review.
 
 The custom Python screen examines both:
 
-1. **Between-construct mixtures:** substantial, strand-supported APC and PIK3CA read populations in the same well.
+1. **Between-construct mixtures:** substantial, strand-supported populations assigned to different panel members, including unexpected sentinel constructs.
 2. **Within-construct variation:** candidate SNPs and primitive indels, including linked alleles on the same reads. Two coherent, strand-supported patterns at separated sites trigger rejection. Isolated or weaker variation triggers review rather than a claim of two templates.
 
 Examples of the **exploratory defaults**, not established sensitivity/specificity:
@@ -167,7 +161,8 @@ Examples of the **exploratory defaults**, not established sensitivity/specificit
 |---|---|
 | Minimum usable support for dominant construct | 50 reads |
 | Minimum read / base quality | Q10 / Q15 |
-| Alignment identity; query and target coverage | 90%; 85% and 85% |
+| Competitive alignment identity / query coverage | 90% / 85%; no full-vector coverage requirement |
+| Dominant-read target coverage for draft eligibility | 85% of the batch-inferred interval |
 | Mapping quality; alignment-score separation | 20; 20 |
 | Strong minor population | At least 5 reads and 10%, with at least 2 per strand |
 | Weaker variation alert | At least 3 reads and 3% |
@@ -176,7 +171,7 @@ Examples of the **exploratory defaults**, not established sensitivity/specificit
 
 The minority fraction is calculated among relevant assigned or informative reads, not raw POD5 counts. The same-construct linked test additionally requires two separated informative sites. Homopolymer-associated evidence is routed to review rather than treated as strong linked-haplotype evidence. Fixed differences shared by all reads are not themselves evidence of a mixture.
 
-Only `PASS_SCREEN` wells produce a read-supported draft and enter Dorado polish. Polishing uses an aligned, sorted/indexed BAM preserving Dorado metadata. Combining read groups is allowed only after verifying that all read-group headers specify the same basecalling model. A post-polish realignment rechecks support and residual variation, masks unsupported bases with `N`, and withholds consensus on failure. Final accepted status is `CONSENSUS_PASS`.
+Only expected constructs with an inferred interval and `PASS_SCREEN` wells produce a read-supported draft and enter Dorado polish. Polishing uses an aligned, sorted/indexed BAM preserving Dorado metadata. Combining read groups is allowed only after verifying that all read-group headers specify the same basecalling model. A post-polish realignment rechecks support and residual variation, masks unsupported bases with `N`, and withholds consensus on failure. Final accepted status is `CONSENSUS_PASS`.
 
 **Limits:** identical templates are indistinguishable; low-abundance, closely related, or poorly sequenced mixtures can be missed; systematic ONT/PCR errors can cause review or false mixture signals. Complex rearrangements and repeat-associated indels require manual examination. This is a conservative candidate screen, not a validated haplotype caller, a phylogenetic proof of single-template origin, or a clinical pipeline. Do not use it to estimate the number of original molecules from sequencing read counts.
 
@@ -186,11 +181,12 @@ Outputs are published beneath `outdir/tcr_pod5/`:
 
 ```
 audit/                              POD5 inventory and raw UUID provenance
-<batch>/scheme/                     generated scheme and cropped references
+<batch>/scheme/scheme/              generated scheme and full reference panel
 <batch>/basecalling/                calls.bam, summary, model/version provenance
 <batch>/demultiplexing/demux/        assignment TSV, per-well BAMs, unclassified reads
 <batch>/wells/<well>/trimming/       clean.bam, <well>.fastq.gz, failed reads, audit
-<batch>/wells/<well>/alignment/      coordinate-sorted BAM and index
+<batch>/wells/<well>/alignment/      full-panel coordinate-sorted BAM and index
+<batch>/target_inference/targets/    inferred BED, JSON, summary TSV, read evidence
 <batch>/wells/<well>/heterogeneity/qc/
                                     decision, assignment, allele/haplotype evidence
 <batch>/wells/<well>/consensus/consensus_result/
@@ -199,16 +195,16 @@ summary/                            well_summary.tsv, run_summary.json,
                                     accepted_consensus.fasta
 ```
 
-Every expected well appears in the final summary, including `NO_READS`. Mixed and review wells are excluded from `accepted_consensus.fasta` without deleting their evidence. An all-rejected run legitimately produces an empty accepted FASTA. IDs include batch and well to prevent collisions. Variant positions in QC refer to the **cropped amplicon**; masked-position BEDs refer to the **polished amplicon**. `scheme.json` records original-reference coordinates.
+Every expected well appears in the final summary, including `NO_READS`. Mixed and review wells are excluded from `accepted_consensus.fasta` without deleting their evidence. An all-rejected run legitimately produces an empty accepted FASTA. IDs include batch and well to prevent collisions. Variant positions in heterogeneity QC refer to the **original full reference**, restricted to the inferred target. Draft sequences span that target. Masked-position BEDs refer to the **polished amplicon**, whose coordinates can differ after indels. `inferred_targets.json` records original-reference boundaries.
 
 This branch produces TSV/JSON reports, not a customized MultiQC report or a final multiple-sequence alignment/tree. Those are separate extensions beyond the requested consensus gate.
 
 ## 8. Validation and interpretation
 
-Run included tests from the unpacked package:
+Run the repository tests:
 
 ```bash
-python3 -m unittest discover -s viralrecon_tcr_pod5/tests -v
+python3 -m unittest discover -s tests/tcr_pod5 -v
 ```
 
 With Dorado 2.1.2 and samtools available, enable the optional executable smoke test:
@@ -216,7 +212,7 @@ With Dorado 2.1.2 and samtools available, enable the optional executable smoke t
 ```bash
 TCR_TEST_DORADO=/opt/dorado-2.1.2-linux-x64/bin/dorado \
 TCR_TEST_SAMTOOLS=/path/to/samtools \
-python3 -m unittest discover -s viralrecon_tcr_pod5/tests -v
+python3 -m unittest discover -s tests/tcr_pod5 -v
 ```
 
 That test exercises **synthetic barcode classification and trimming only**, not POD5 basecalling or polishing. A successful result does not validate the full workflow or biological thresholds.
@@ -233,6 +229,7 @@ Before broader use, perform a small POD5 end-to-end run on the cluster and chall
 - [Dorado read trimming](https://software-docs.nanoporetech.com/dorado/latest/basecaller/read_trimming/)
 - [Dorado alignment](https://software-docs.nanoporetech.com/dorado/latest/basecaller/alignment/)
 - [Dorado polishing requirements](https://software-docs.nanoporetech.com/dorado/latest/secondary/polish/)
+- [Minimap2 base-level alignment and PAF semantics](https://github.com/lh3/minimap2)
 - [POD5 tools and Python API](https://pod5-file-format.readthedocs.io/en/latest/)
 
 The mixture rules and thresholds are custom prototype choices, not recommendations established by those tool manuals.
