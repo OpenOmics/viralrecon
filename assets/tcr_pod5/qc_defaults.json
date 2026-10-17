@@ -1,5 +1,7 @@
 {
   "min_reads": 50,
+  "polish_min_reads": 20,
+  "polish_min_callable_fraction": 0.8,
   "min_baseq": 15,
   "min_read_q": 10.0,
   "min_identity": 0.9,

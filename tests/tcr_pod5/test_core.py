@@ -211,6 +211,23 @@ class ScreenTests(unittest.TestCase):
         report, _, _ = self.decision(population(alt=change(REF, [60]), n_alt=20))
         self.assertEqual(report['status'], 'REVIEW')
         self.assertIn('REVIEW_WITHIN_CONSTRUCT_VARIATION', report['reasons'])
+        self.assertEqual(report['blocking_variation_sites'], 1)
+        self.assertTrue(report['polish_eligible'])
+
+    def test_weak_single_snp_is_warning_only(self):
+        report, _, _ = self.decision(population(alt=change(REF, [60]), n_alt=3))
+        self.assertEqual(report['status'], 'PASS_SCREEN')
+        self.assertIn('WARN_WITHIN_CONSTRUCT_VARIATION', report['warnings'])
+        self.assertEqual(report['blocking_variation_sites'], 0)
+
+    def test_strong_homopolymer_variation_is_warning_only(self):
+        hp_ref = REF[:50] + 'AAAAAA' + REF[56:]
+        alt = change(hp_ref, [52])
+        reads = [read(f'r{i}', alt if i < 20 else hp_ref, reverse=(i % 2 == 1)) for i in range(60)]
+        report, _, _ = screen(['APC'] * 60, reads, {'APC': hp_ref}, Settings())
+        self.assertEqual(report['status'], 'PASS_SCREEN')
+        self.assertIn('WARN_HOMOPOLYMER_VARIATION', report['warnings'])
+        self.assertEqual(report['blocking_variation_sites'], 0)
 
     def test_same_construct_linked_haplotypes_rejected(self):
         report, _, _ = self.decision(population(alt=change(REF, [60, 160]), n_alt=20))
@@ -221,6 +238,13 @@ class ScreenTests(unittest.TestCase):
         report, _, _ = self.decision(population(10))
         self.assertNotEqual(report['status'], 'PASS_SCREEN')
         self.assertIn('LOW_SUPPORT', report['reasons'])
+        self.assertFalse(report['polish_eligible'])
+
+    def test_low_support_review_can_enter_polish(self):
+        report, _, _ = self.decision(population(30))
+        self.assertEqual(report['status'], 'REVIEW')
+        self.assertIn('LOW_SUPPORT', report['reasons'])
+        self.assertTrue(report['polish_eligible'])
 
     def test_one_strand_withheld(self):
         reads = [read(f'r{i}') for i in range(60)]
@@ -268,15 +292,25 @@ class ScreenTests(unittest.TestCase):
         self.assertEqual(report['status'], 'REJECT')
         self.assertIn('REJECT_LINKED_HAPLOTYPES', report['reasons'])
 
-    def test_unresolved_fraction_blocks_consensus(self):
+    def test_ambiguous_reference_is_warning_not_unresolved_failure(self):
         reads = population()
         report, _, _ = self.decision(reads, labels=['APC'] * 60 + ['ambiguous_reference'] * 20)
-        self.assertIn('REVIEW_UNRESOLVED_READS', report['reasons'])
+        self.assertNotIn('REVIEW_UNRESOLVED_READS', report['reasons'])
+        self.assertIn('WARN_AMBIGUOUS_REFERENCE', report['warnings'])
+        self.assertEqual(report['ambiguous_reference_reads'], 20)
 
-    def test_trim_failure_blocks_consensus(self):
+    def test_nonambiguous_unresolved_fraction_blocks_consensus(self):
+        reads = population()
+        report, _, _ = self.decision(reads, labels=['APC'] * 60 + ['unmapped'] * 20)
+        self.assertIn('REVIEW_UNRESOLVED_READS', report['reasons'])
+        self.assertFalse(report['polish_eligible'])
+
+    def test_trim_failure_is_warning_only(self):
         report, _, _ = screen(['APC'] * 60, population(), {'APC': REF}, Settings(),
                              dict(input_reads=100, failed_reads=40))
-        self.assertIn('REVIEW_PRIMER_TRIMMING', report['reasons'])
+        self.assertNotIn('REVIEW_PRIMER_TRIMMING', report['reasons'])
+        self.assertIn('WARN_PRIMER_TRIMMING', report['warnings'])
+        self.assertEqual(report['status'], 'PASS_SCREEN')
 
     def test_settings_reject_unknown(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -305,6 +339,45 @@ class DriverTests(unittest.TestCase):
                        bam='reads.sam', samtools='samtools', inferred_targets='targets.json', trim_stats='trim.json', sample='b__A1', batch='b', well='A1'))
                 self.assertEqual(Path('pass').exists(), not mixed)
                 self.assertEqual(Path('qc/decision.json').exists(), True)
+
+    def test_qc_emits_polish_gate_for_low_support_review(self):
+        with tempfile.TemporaryDirectory() as tmp, working(tmp):
+            write_fasta('refs.fasta', {'APC': REF})
+            Path('settings.json').write_text('{}')
+            Path('trim.json').write_text(json.dumps(dict(input_reads=30, passed_reads=30, failed_reads=0)))
+            reads = population(30)
+            Path('reads.sam').write_text('@HD\tVN:1.6\n' + ''.join(r.line for r in sorted(reads, key=lambda r: r.name)))
+            from tcr_pod5_targets import reference_digest
+            Path('targets.json').write_text(json.dumps(dict(batch='b', reference_digest=reference_digest({'APC': REF}),
+                expected_constructs=['APC'], references={'APC': dict(status='INFERRED', start=0, end=len(REF))})))
+            cmd_qc(argparse.Namespace(settings='settings.json', references='refs.fasta',
+                   bam='reads.sam', samtools='samtools', inferred_targets='targets.json', trim_stats='trim.json',
+                   sample='b__A1', batch='b', well='A1'))
+            decision = json.loads(Path('qc/decision.json').read_text())
+            self.assertEqual(decision['status'], 'REVIEW')
+            self.assertTrue(decision['polish_eligible'])
+            self.assertTrue(Path('pass').exists())
+
+    def test_report_separates_review_consensus(self):
+        with tempfile.TemporaryDirectory() as tmp, working(tmp):
+            Path('demux').mkdir()
+            Path('qc').mkdir()
+            Path('pol').mkdir()
+            Path('demux/manifest.json').write_text(json.dumps([dict(well='A1', reads=30, batch='b')]))
+            Path('qc/decision.json').write_text(json.dumps(dict(sample='b__A1', status='REVIEW', reasons=['LOW_SUPPORT'],
+                 warnings=['WARN_PRIMER_TRIMMING'], polish_eligible=True, dominant_construct='APC',
+                 assigned_reads=30, callable_fraction=0.95)))
+            Path('pol/decision.json').write_text(json.dumps(dict(sample='b__A1', status='REVIEW',
+                 reasons=['REVIEW_POSTPOLISH_READ_SUPPORT'], warnings=[])))
+            write_fasta('pol/review_consensus.fasta', {'b__A1': REF})
+            Path('report.json').write_text(json.dumps(dict(demux_dirs=['demux'], qc_dirs=['qc'],
+                 polish_dirs=['pol'], target_dirs=[])))
+            cmd_report(argparse.Namespace(manifest='report.json'))
+            self.assertEqual(Path('accepted_consensus.fasta').read_text(), '')
+            self.assertEqual(read_fasta('review_consensus.fasta')['b__A1'], REF)
+            out = json.loads(Path('run_summary.json').read_text())
+            self.assertEqual(out['accepted_consensuses'], 0)
+            self.assertEqual(out['review_consensuses'], 1)
 
     def test_all_rejected_report_has_no_consensus(self):
         with tempfile.TemporaryDirectory() as tmp, working(tmp):

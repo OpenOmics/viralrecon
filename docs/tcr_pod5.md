@@ -1,6 +1,6 @@
 # POD5-first TCR analysis extension for nf-core/viralrecon
 
-**Status:** development prototype, not an assay-validated pipeline. The BED-free update has **91 passing Python tests and 1 skipped external-tool test**. These include synthetic SAM-to-inference-to-QC integration tests, not a Nextflow/Dorado/GPU end-to-end run. See [validation and migration notes](tcr_pod5_target_inference.md).
+**Status:** development prototype, not an assay-validated pipeline. The branch includes synthetic SAM-to-inference-to-QC tests plus an optional Dorado/samtools smoke test; it still requires full Nextflow/Dorado/GPU validation on the target system. See [validation and migration notes](tcr_pod5_target_inference.md).
 
 This is the opt-in, POD5-only TCR path in the `OpenOmics/viralrecon` `tcr-pod5` branch, originally based on upstream commit `fa23078485cb75e96add952045b2b897aab61b42`. Stock workflows remain separate. No stock Nextflow regression run was performed for this update.
 
@@ -18,12 +18,14 @@ POD5 files grouped by supplied batch
     -> pool qualifying alignments across wells within each batch
     -> infer shared, reference-specific amplicon intervals
        (inferred_targets.bed is an OUTPUT, not an input)
-    -> within-well heterogeneity screen
-         REJECT / REVIEW -> no consensus; retain evidence and reads
-         PASS_SCREEN     -> read-supported draft
-                             -> Dorado polishing
-                             -> realignment / coverage and variation recheck
-                             -> masked consensus only if final checks pass
+    -> within-well heterogeneity / reconstruction screen
+         hard mixture or structural blocker -> no polish; retain evidence and reads
+         PASS_SCREEN or polish-eligible REVIEW
+                         -> read-supported draft
+                         -> Dorado polishing
+                         -> realignment / coverage and variation recheck
+                         -> CONSENSUS_PASS: accepted_consensus.fasta
+                         -> REVIEW: diagnostic review_consensus.fasta
 ```
 
 For PID201588, the expected constructs are **APC and PIK3CA**. The competitive panel can also include PID201403 and PID202478 as contamination sentinels. Use `expected_constructs` to declare which FASTA IDs are eligible for consensus; all records remain available for mapping. Each batch/well is a separate analysis unit, for example `preinfusion_201588_run1__A1`. Acquisitions are not equated to biological wells. Batch boundaries remain explicit even if acquisition IDs appear in more than one directory.
@@ -159,7 +161,8 @@ Examples of the **exploratory defaults**, not established sensitivity/specificit
 
 | Check | Default |
 |---|---|
-| Minimum usable support for dominant construct | 50 reads |
+| Minimum support for final accepted consensus | 50 reads |
+| Minimum support / callable fraction to attempt polishing | 20 reads / 80% |
 | Minimum read / base quality | Q10 / Q15 |
 | Competitive alignment identity / query coverage | 90% / 85%; no full-vector coverage requirement |
 | Dominant-read target coverage for draft eligibility | 85% of the batch-inferred interval |
@@ -169,9 +172,11 @@ Examples of the **exploratory defaults**, not established sensitivity/specificit
 | Minimum consensus depth / base support | 20 / 80% |
 | Required callable amplicon fraction | 98% |
 
-The minority fraction is calculated among relevant assigned or informative reads, not raw POD5 counts. The same-construct linked test additionally requires two separated informative sites. Homopolymer-associated evidence is routed to review rather than treated as strong linked-haplotype evidence. Fixed differences shared by all reads are not themselves evidence of a mixture.
+The minority fraction is calculated among relevant assigned or informative reads, not raw POD5 counts. Candidate sites remain sensitive at >=3 reads and >=3%, but a site blocks consensus only when the minor allele has >=5 reads, >=10% support, >=2 reads on each strand, and is not homopolymer-associated. Strong homopolymer-associated, weaker, or strand-biased sites remain explicit warnings/evidence. The same-construct linked test still requires two separated informative sites and remains a hard rejection criterion. Fixed differences shared by all reads are not themselves evidence of a mixture.
 
-Only expected constructs with an inferred interval and `PASS_SCREEN` wells produce a read-supported draft and enter Dorado polish. Polishing uses an aligned, sorted/indexed BAM preserving Dorado metadata. Combining read groups is allowed only after verifying that all read-group headers specify the same basecalling model. A post-polish realignment rechecks support and residual variation, masks unsupported bases with `N`, and withholds consensus on failure. Final accepted status is `CONSENSUS_PASS`.
+`ambiguous_reference` reads remain excluded from construct evidence and consensus, but are reported separately rather than counted in the unresolved-fraction numerator because shared vector sequence can make otherwise good reads non-discriminating. A high primer-trim failure fraction is likewise retained as a warning; only successfully trimmed reads can enter downstream evidence.
+
+Polishing and acceptance are separate decisions. Expected constructs with an inferred interval may enter Dorado polish when at least 20 complete dominant reads remain, the draft is at least 80% callable, strand support is adequate, and there is no hard mixture/structural blocker. Final `CONSENSUS_PASS` still requires the configured 50-read support, depth/callable thresholds, coherent post-polish alignments, no fixed-indel disagreement, and no strong bidirectional non-homopolymer variation. A polished sequence that remains `REVIEW` is retained in `review_consensus.fasta` for inspection but is never added to `accepted_consensus.fasta`.
 
 **Limits:** identical templates are indistinguishable; low-abundance, closely related, or poorly sequenced mixtures can be missed; systematic ONT/PCR errors can cause review or false mixture signals. Complex rearrangements and repeat-associated indels require manual examination. This is a conservative candidate screen, not a validated haplotype caller, a phylogenetic proof of single-template origin, or a clinical pipeline. Do not use it to estimate the number of original molecules from sequencing read counts.
 
@@ -190,12 +195,12 @@ audit/                              POD5 inventory and raw UUID provenance
 <batch>/wells/<well>/heterogeneity/qc/
                                     decision, assignment, allele/haplotype evidence
 <batch>/wells/<well>/consensus/consensus_result/
-                                    post-polish decision; consensus only on pass
+                                    post-polish decision and accepted/review sequence
 summary/                            well_summary.tsv, run_summary.json,
-                                    accepted_consensus.fasta
+                                    accepted_consensus.fasta, review_consensus.fasta
 ```
 
-Every expected well appears in the final summary, including `NO_READS`. Mixed and review wells are excluded from `accepted_consensus.fasta` without deleting their evidence. An all-rejected run legitimately produces an empty accepted FASTA. IDs include batch and well to prevent collisions. Variant positions in heterogeneity QC refer to the **original full reference**, restricted to the inferred target. Draft sequences span that target. Masked-position BEDs refer to the **polished amplicon**, whose coordinates can differ after indels. `inferred_targets.json` records original-reference boundaries.
+Every expected well appears in the final summary, including `NO_READS`. Mixed and review wells are excluded from `accepted_consensus.fasta` without deleting their evidence. Polished REVIEW wells are collected separately in `review_consensus.fasta` and remain diagnostic-only. An all-rejected run legitimately produces an empty accepted FASTA. IDs include batch and well to prevent collisions. Variant positions in heterogeneity QC refer to the **original full reference**, restricted to the inferred target. Draft sequences span that target. Masked-position BEDs refer to the **polished amplicon**, whose coordinates can differ after indels. `inferred_targets.json` records original-reference boundaries.
 
 This branch produces TSV/JSON reports, not a customized MultiQC report or a final multiple-sequence alignment/tree. Those are separate extensions beyond the requested consensus gate.
 

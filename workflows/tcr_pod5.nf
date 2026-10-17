@@ -132,5 +132,6 @@ workflow TCR_POD5 {
     inferred_targets = TCR_INFER_TARGETS.out.result
     well_summary = TCR_REPORT.out.table
     consensus = TCR_REPORT.out.consensus
+    review_consensus = TCR_REPORT.out.review_consensus
     summary = TCR_REPORT.out.json
 }

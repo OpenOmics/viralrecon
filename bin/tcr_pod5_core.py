@@ -16,7 +16,7 @@ from itertools import combinations
 from pathlib import Path
 from typing import Iterable
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 DNA = set("ACGT")
 WELL = re.compile(r"[A-H](?:[1-9]|1[0-2])$")
 SAFE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*$")
@@ -233,6 +233,8 @@ midstrand_flank_score = 0.95
 @dataclass
 class Settings:
     min_reads: int = 50
+    polish_min_reads: int = 20
+    polish_min_callable_fraction: float = 0.80
     min_baseq: int = 15
     min_read_q: float = 10.0
     min_identity: float = 0.90
@@ -279,13 +281,13 @@ class Settings:
                 raise ValueError(f"QC option {key} must be an integer")
         for key in ("min_identity", "min_query_coverage", "min_target_coverage", "minor_fraction",
                     "alert_fraction", "max_unresolved_fraction", "max_trim_fail_fraction",
-                    "consensus_fraction", "min_callable_fraction", "target_min_query_coverage",
-                    "target_min_cluster_fraction"):
+                    "consensus_fraction", "min_callable_fraction", "polish_min_callable_fraction",
+                    "target_min_query_coverage", "target_min_cluster_fraction"):
             if not 0 < getattr(obj, key) <= 1:
                 raise ValueError(f"QC option {key} must be in (0,1]")
         if not obj.alert_fraction < obj.minor_fraction <= 0.5:
             raise ValueError("Require alert_fraction < minor_fraction <= 0.5")
-        if obj.consensus_fraction <= 0.5 or obj.min_reads < 1 or obj.min_depth < 1:
+        if obj.consensus_fraction <= 0.5 or obj.min_reads < 1 or obj.polish_min_reads < 1 or obj.min_depth < 1:
             raise ValueError("Invalid consensus or support thresholds")
         for key in ("target_min_reads", "target_min_wells", "target_min_reads_per_well",
                     "target_min_each_strand", "target_min_alignment_length", "target_boundary_tolerance"):
@@ -480,6 +482,24 @@ def evidence(reads: list[Sam], ref: str, cfg: Settings, interval=None):
             if minor >= cfg.alert_reads and minor / sum(counts.values()) >= cfg.alert_fraction:
                 sites.append(dict(kind=kind, pos=pos, sequence=seq, alleles=dict(counts), calls=calls,
                                   homopolymer=low_complexity(ref, pos, cfg.homopolymer_length)))
+    # Annotate every sensitive candidate site with the stronger, strand-balanced
+    # evidence used for consensus blocking. Candidate detection remains intentionally
+    # sensitive (alert_reads / alert_fraction); acceptance uses the stronger rule.
+    for site in sites:
+        counts = Counter(site["alleles"])
+        ranked = counts.most_common()
+        minor_allele, minor_count = ranked[1]
+        informative = sum(counts.values())
+        minor_ids = [rid for rid, allele in site["calls"].items() if allele == minor_allele]
+        minor_strands = Counter(strands[rid] for rid in minor_ids)
+        strong_minor = (minor_count >= cfg.minor_reads
+                        and minor_count / max(1, informative) >= cfg.minor_fraction
+                        and min(minor_strands.get("+", 0), minor_strands.get("-", 0)) >= cfg.minor_each_strand)
+        site.update(minor_allele=minor_allele, minor_count=minor_count,
+                    minor_fraction=minor_count / max(1, informative),
+                    minor_strand_counts=dict(minor_strands), strong_minor=strong_minor,
+                    blocking_variation=strong_minor and not site["homopolymer"])
+
     links = []
     for a, b in combinations(sites, 2):
         if a["homopolymer"] or b["homopolymer"] or abs(a["pos"] - b["pos"]) < cfg.phase_spacing:
@@ -553,7 +573,7 @@ def screen(assignments, assigned_reads, refs, cfg: Settings, trim_stats=None,
     dominant = ranked[0]
     n_assigned = sum(construct_counts.values())
     total = sum(counts.values())
-    reasons, strong_mixture = [], []
+    reasons, warnings, strong_mixture = [], [], []
     if total < cfg.min_reads or construct_counts[dominant] < cfg.min_reads:
         reasons.append("LOW_SUPPORT")
     for ref in ranked[1:]:
@@ -568,15 +588,23 @@ def screen(assignments, assigned_reads, refs, cfg: Settings, trim_stats=None,
                 reasons.append("REVIEW_SECOND_CONSTRUCT")
     if strong_mixture:
         reasons.append("REJECT_MULTIPLE_CONSTRUCTS")
-    unresolved = total - n_assigned
-    if unresolved / max(1, total) > cfg.max_unresolved_fraction:
+
+    # Shared vector sequence can make reads non-discriminating between otherwise
+    # valid references. Keep those reads out of consensus evidence, but do not count
+    # them as failed/unresolved reads for the unresolved-fraction gate.
+    ambiguous_reference_reads = counts.get("ambiguous_reference", 0)
+    unresolved_for_qc = total - n_assigned - ambiguous_reference_reads
+    if ambiguous_reference_reads:
+        warnings.append("WARN_AMBIGUOUS_REFERENCE")
+    if unresolved_for_qc / max(1, total) > cfg.max_unresolved_fraction:
         reasons.append("REVIEW_UNRESOLVED_READS")
     if counts.get("split_alignment", 0) >= cfg.alert_reads:
         reasons.append("REVIEW_SPLIT_ALIGNMENTS")
     if trim_stats:
         n, failed = trim_stats["input_reads"], trim_stats["failed_reads"]
         if failed / max(1, n) > cfg.max_trim_fail_fraction:
-            reasons.append("REVIEW_PRIMER_TRIMMING")
+            warnings.append("WARN_PRIMER_TRIMMING")
+
     selected = [r for r in assigned_reads if r.ref == dominant]
     target = targets.get(dominant) if targets is not None else (0, len(refs[dominant]))
     target_partial_reads = 0
@@ -595,7 +623,6 @@ def screen(assignments, assigned_reads, refs, cfg: Settings, trim_stats=None,
         complete = [r for r in selected
                     if max(0, min(end, r.end) - max(start, r.start)) / (end - start) >= cfg.min_target_coverage]
         target_partial_reads = len(selected) - len(complete)
-        # Keep these reads in reference-assignment counts; only exclude from the draft.
         if target_partial_reads / max(1, len(selected)) > cfg.max_unresolved_fraction:
             reasons.append("REVIEW_PARTIAL_TARGET_READS")
         selected = complete
@@ -604,35 +631,70 @@ def screen(assignments, assigned_reads, refs, cfg: Settings, trim_stats=None,
     strands = Counter(r.strand for r in selected)
     if min(strands.get("+", 0), strands.get("-", 0)) < cfg.min_strand_reads:
         reasons.append("REVIEW_STRAND_SUPPORT")
+
     if target is None:
         ev = dict(sites=[], links=[], pile={}, events=[], draft="", callable_fraction=None,
                   conflicting_fixed_indels=False, strands=dict(strands))
     else:
         ev = evidence(selected, refs[dominant], cfg, target)
+    strong_sites = [site for site in ev["sites"] if site.get("strong_minor")]
+    blocking_sites = [site for site in strong_sites if site.get("blocking_variation")]
     if ev["links"]:
         reasons.append("REJECT_LINKED_HAPLOTYPES")
-    elif ev["sites"]:
+    elif blocking_sites:
         reasons.append("REVIEW_WITHIN_CONSTRUCT_VARIATION")
+    elif ev["sites"]:
+        warnings.append("WARN_WITHIN_CONSTRUCT_VARIATION")
+    if any(site.get("strong_minor") and site.get("homopolymer") for site in ev["sites"]):
+        warnings.append("WARN_HOMOPOLYMER_VARIATION")
     if ev["callable_fraction"] is not None and ev["callable_fraction"] < cfg.min_callable_fraction:
         reasons.append("REVIEW_INCOMPLETE_COVERAGE")
     if ev["conflicting_fixed_indels"]:
         reasons.append("REVIEW_CONFLICTING_INDELS")
+
     if any(x.startswith("REJECT") for x in reasons):
         status = "REJECT"
     elif reasons:
         status = "REVIEW"
     else:
         status = "PASS_SCREEN"
-    report = dict(status=status, reasons=sorted(set(reasons)), dominant_construct=dominant,
-                  total_reads=total, assigned_reads=n_assigned, construct_counts=construct_counts,
+
+    # Polishing is a reconstruction step, not an acceptance decision. Some REVIEW
+    # wells may enter polish when there is enough complete, strand-balanced dominant
+    # evidence and no hard/structural blocker. Final acceptance remains stricter.
+    polish_blockers = []
+    persistent = {
+        "REVIEW_SECOND_CONSTRUCT", "REVIEW_SPLIT_ALIGNMENTS", "REVIEW_UNRESOLVED_READS",
+        "REVIEW_UNEXPECTED_CONSTRUCT", "REVIEW_TARGET_NOT_INFERRED", "REVIEW_TARGET_BOUNDARIES",
+        "REVIEW_PARTIAL_TARGET_READS", "REVIEW_CONFLICTING_INDELS",
+    }
+    for reason in reasons:
+        if reason.startswith("REJECT") or reason in persistent:
+            polish_blockers.append(reason)
+    if len(selected) < cfg.polish_min_reads:
+        polish_blockers.append("POLISH_LOW_SUPPORT")
+    if min(strands.get("+", 0), strands.get("-", 0)) < cfg.min_strand_reads:
+        polish_blockers.append("POLISH_STRAND_SUPPORT")
+    if ev["callable_fraction"] is None or ev["callable_fraction"] < cfg.polish_min_callable_fraction:
+        polish_blockers.append("POLISH_INCOMPLETE_COVERAGE")
+    polish_eligible = not polish_blockers
+
+    report = dict(status=status, reasons=sorted(set(reasons)), warnings=sorted(set(warnings)),
+                  polish_eligible=polish_eligible, polish_blockers=sorted(set(polish_blockers)),
+                  dominant_construct=dominant, total_reads=total, assigned_reads=n_assigned,
+                  construct_counts=construct_counts,
                   unresolved_counts={k: v for k, v in counts.items() if k not in refs},
+                  ambiguous_reference_reads=ambiguous_reference_reads,
+                  unresolved_for_qc=unresolved_for_qc,
                   strand_counts=dict(strands), callable_fraction=ev["callable_fraction"],
-                  candidate_sites=len(ev["sites"]), linked_haplotypes=ev["links"],
+                  candidate_sites=len(ev["sites"]), strong_candidate_sites=len(strong_sites),
+                  blocking_variation_sites=len(blocking_sites), linked_haplotypes=ev["links"],
                   target_interval=list(target) if target is not None else None,
                   target_partial_reads=target_partial_reads,
                   target_boundary_outlier_reads=target_boundary_outlier_reads,
                   evidence_coordinates="original reference, 0-based; draft spans target_interval",
                   expected_constructs=sorted(expected_constructs) if expected_constructs is not None else None,
                   settings=asdict(cfg), software_version=VERSION,
-                  interpretation="No detected mixture above this screen's thresholds is not proof of one original molecule.")
+                  interpretation=("Polish eligibility permits reconstruction of some REVIEW wells; "
+                                  "CONSENSUS_PASS remains a separate post-polish acceptance decision."))
     return report, ev, selected
