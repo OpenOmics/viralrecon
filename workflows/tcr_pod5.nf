@@ -133,5 +133,6 @@ workflow TCR_POD5 {
     well_summary = TCR_REPORT.out.table
     consensus = TCR_REPORT.out.consensus
     review_consensus = TCR_REPORT.out.review_consensus
+    diagnostic_consensus = TCR_REPORT.out.diagnostic_consensus
     summary = TCR_REPORT.out.json
 }

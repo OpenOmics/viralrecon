@@ -209,6 +209,7 @@ process TCR_REPORT {
     path 'well_summary.tsv', emit: table
     path 'accepted_consensus.fasta', emit: consensus
     path 'review_consensus.fasta', emit: review_consensus
+    path 'diagnostic_consensus.fasta', emit: diagnostic_consensus
     path 'run_summary.json', emit: json
     script:
     def asStrings = { v -> (v instanceof List ? v : (v ? [v] : [])).collect { it.toString() } }

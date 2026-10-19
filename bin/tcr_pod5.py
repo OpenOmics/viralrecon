@@ -22,7 +22,8 @@ from collections import Counter, defaultdict
 
 from tcr_pod5_targets import Endpoint, infer_targets, load_intervals, target_candidate
 
-from tcr_pod5_core import (VERSION, Settings, Sam, assign, build_scheme, evidence,
+from tcr_pod5_core import (VERSION, Settings, Sam, alignment_identity, assign, build_scheme,
+                            diagnostic_consensus, evidence,
                             full_primer_match, rc, read_fasta, screen, write_fasta)
 
 
@@ -418,23 +419,40 @@ def cmd_qc(a):
     counts, good, seen = Counter(), [], set()
     Path("qc").mkdir()
     with open("qc/read_assignments.tsv", "w") as table:
-        table.write("read_id\tassignment\tstrand\n")
+        table.write("read_id\tassignment\tstrand\traw_identity\tdeletion_aware_identity\t"
+                    "exempt_deleted_bases\tinternal_deletions_0based\n")
         for name, records in itertools.groupby(alignments(a.bam, a.samtools), key=lambda r: r.name):
             if name in seen:
                 raise ValueError("QC requires a query-name sorted BAM; repeated nonconsecutive read ID")
             seen.add(name)
-            status, chosen = assign(list(records), refs, cfg, require_target_coverage=False)
+            records = list(records)
+            status, chosen = assign(records, refs, cfg, require_target_coverage=False)
             counts[status] += 1
             if chosen:
                 good.append(chosen)
-            table.write(f"{name}\t{status}\t{chosen.strand if chosen else '.'}\n")
+            primary = next(r for r in records if not r.flag & (256 | 2048))
+            metrics = alignment_identity(primary, cfg) if not primary.flag & 4 else {}
+            table.write(f"{name}\t{status}\t{chosen.strand if chosen else '.'}\t"
+                        f"{metrics.get('raw_identity', '')}\t{metrics.get('deletion_aware_identity', '')}\t"
+                        f"{metrics.get('exempt_deleted_bases', '')}\t{json.dumps(metrics.get('internal_deletions', []))}\n")
     trim = json.loads(Path(a.trim_stats).read_text())
     if sum(counts.values()) != trim["passed_reads"]:
         raise ValueError("Alignment/trimmed read accounting mismatch")
     report, ev, selected = screen(list(counts.elements()), good, refs, cfg, trim,
                                   targets=targets, expected_constructs=target_report["expected_constructs"])
     report.update(sample=a.sample, batch=a.batch, well=a.well, trim_stats=trim,
-                  target_inference=target_report["references"][report["dominant_construct"]])
+                  target_inference=target_report["references"].get(report["dominant_construct"], {}))
+    diagnostic, draft = diagnostic_consensus(report, selected, refs, cfg)
+    report["diagnostic"] = diagnostic
+    if draft is not None:
+        label = (f"{a.sample} status=DIAGNOSTIC_UNPOLISHED accepted=false "
+                 f"construct={report['dominant_construct']} min_depth={cfg.diagnostic_min_depth}")
+        write_fasta("qc/diagnostic_consensus.fasta", {label: draft})
+        with open("qc/diagnostic_masked_positions.bed", "w") as handle:
+            for pos, base in enumerate(draft):
+                if base == "N":
+                    handle.write(f"{a.sample}\t{pos}\t{pos + 1}\n")
+        diagnostic["coordinates"] = "Masked BED uses the diagnostic draft after supported indels, not reference coordinates"
     dump("qc/decision.json", report)
     with open("qc/allele_support.tsv", "w") as table:
         table.write("kind\tposition_0based\thomopolymer\tminor_allele\tminor_count\tminor_fraction\t"
@@ -474,7 +492,8 @@ def cmd_polish(a):
     dorado_version(a.dorado, a.version)
     passed = Path(a.passed)
     screen_report = json.loads((passed / "decision.json").read_text())
-    if not screen_report.get("polish_eligible", screen_report.get("status") == "PASS_SCREEN"):
+    if (screen_report.get("status") == "REJECT" or any(r.startswith("REJECT") for r in screen_report.get("reasons", []))
+            or not screen_report.get("polish_eligible", screen_report.get("status") == "PASS_SCREEN")):
         raise ValueError("Refusing to polish a well that did not clear the reconstruction gate")
     run([a.samtools, "view", "-b", "-N", passed / "accepted.ids", "-o", "accepted.bam", a.bam])
     model = check_basecall_models("accepted.bam", a.samtools)
@@ -497,12 +516,14 @@ def cmd_polish(a):
         post_status[status] += 1
         if chosen:
             reads.append(chosen)
-    ev = evidence(reads, seq, cfg)
+    ev = evidence(reads, seq, cfg, mask_variation=True)
+    variation_mask = set(ev["masked_variation_positions"])
     output, masked = [], []
     for pos, base in enumerate(seq):
         counts = Counter(ev["pile"].get(pos, {}).values())
         depth = sum(counts.values())
-        if base in "ACGT" and depth >= cfg.min_depth and counts[base] / max(1, depth) >= cfg.consensus_fraction:
+        if (pos not in variation_mask and base in "ACGT" and depth >= cfg.min_depth
+                and counts[base] / max(1, depth) >= cfg.consensus_fraction):
             output.append(base)
         else:
             output.append("N")
@@ -513,7 +534,11 @@ def cmd_polish(a):
         if sum(counts.values()) >= cfg.min_depth and counts["ALT"] / sum(counts.values()) >= cfg.consensus_fraction:
             fixed_indels.append(event)
 
-    reasons, warnings = [], []
+    # Polishing cannot establish that a pre-existing biological mixture disappeared.
+    # Only numerical support/coverage checks may be replaced by post-polish checks.
+    reassessed = {"LOW_SUPPORT", "LOW_TARGET_SUPPORT", "REVIEW_STRAND_SUPPORT", "REVIEW_INCOMPLETE_COVERAGE"}
+    reasons = [r for r in screen_report.get("reasons", []) if r not in reassessed]
+    warnings = []
     ambiguous_reference_reads = post_status.get("ambiguous_reference", 0)
     unresolved_for_qc = sum(post_status.values()) - len(reads) - ambiguous_reference_reads
     if ambiguous_reference_reads:
@@ -522,6 +547,11 @@ def cmd_polish(a):
         reasons.append("REVIEW_POSTPOLISH_ALIGNMENTS")
     if post_status.get("split_alignment", 0) >= cfg.alert_reads:
         reasons.append("REVIEW_POSTPOLISH_SPLIT_ALIGNMENTS")
+    if ev["links"]:
+        reasons.append("REJECT_POSTPOLISH_LINKED_HAPLOTYPES")
+    strands = Counter(r.strand for r in reads)
+    if min(strands.get("+", 0), strands.get("-", 0)) < cfg.min_strand_reads:
+        reasons.append("REVIEW_POSTPOLISH_STRAND_SUPPORT")
     strong_sites = [site for site in ev["sites"] if site.get("strong_minor")]
     blocking_sites = [site for site in strong_sites if site.get("blocking_variation")]
     if blocking_sites:
@@ -542,7 +572,8 @@ def cmd_polish(a):
         for pos in masked:
             handle.write(f"{a.sample}\t{pos}\t{pos + 1}\n")
     output_seq = "".join(output)
-    report = dict(sample=a.sample, status="CONSENSUS_PASS" if not reasons else "REVIEW",
+    status = "REJECT" if any(r.startswith("REJECT") for r in reasons) else ("REVIEW" if reasons else "CONSENSUS_PASS")
+    report = dict(sample=a.sample, status=status,
                   reasons=sorted(set(reasons)), warnings=sorted(set(warnings)),
                   masked_bases=len(masked), length=len(seq), basecall_model=model,
                   residual_fixed_indels=fixed_indels, alignment_counts=dict(post_status), dorado_version=a.version,
@@ -550,20 +581,22 @@ def cmd_polish(a):
                   blocking_variation_sites=len(blocking_sites),
                   ambiguous_reference_reads=ambiguous_reference_reads,
                   unresolved_for_qc=unresolved_for_qc,
+                  selected_reads=len(reads), strand_counts=dict(strands), linked_haplotypes=ev["links"],
                   pre_screen_status=screen_report.get("status"),
                   pre_screen_reasons=screen_report.get("reasons", []),
                   pre_screen_warnings=screen_report.get("warnings", []),
                   coordinates="Masked BED uses the polished amplicon, not the original vector reference")
     dump("consensus_result/decision.json", report)
     shutil.copy2("dorado_polish.log", "consensus_result/dorado_polish.log")
-    if reasons:
-        write_fasta("consensus_result/review_consensus.fasta", {a.sample: output_seq})
-    else:
+    if status == "REVIEW":
+        write_fasta("consensus_result/review_consensus.fasta", {
+            f"{a.sample} status=DIAGNOSTIC_POLISHED accepted=false": output_seq})
+    elif status == "CONSENSUS_PASS":
         write_fasta("consensus_result/consensus.fasta", {a.sample: output_seq})
 
 def cmd_report(a):
     data = json.loads(Path(a.manifest).read_text())
-    rows, seqs, review_seqs = [], {}, {}
+    rows, seqs, review_seqs, diagnostic_seqs = [], {}, {}, {}
     target_reports = [json.loads(Path(d, "inferred_targets.json").read_text()) for d in data.get("target_dirs", [])]
     if len({r["batch"] for r in target_reports}) != len(target_reports):
         raise ValueError("Duplicate batch target reports")
@@ -577,7 +610,9 @@ def cmd_report(a):
             row = dict(sample=sample, batch=item["batch"], well=item["well"], raw_assigned_reads=item["reads"],
                        status="NO_READS", reasons="No reads classified to this well", warnings="",
                        polish_eligible=False, dominant_construct="", usable_reads=0, callable_fraction="",
-                       target_status="", target_start="", target_end="")
+                       target_status="", target_start="", target_end="", selected_reads=0,
+                       polish_blockers="", diagnostic_available=False, diagnostic_kind="",
+                       diagnostic_callable_fraction="", diagnostic_blockers="")
             q_warnings = []
             if item["reads"] and sample not in qc:
                 raise ValueError(f"Missing well QC result: {sample}")
@@ -590,11 +625,16 @@ def cmd_report(a):
                            usable_reads=q["assigned_reads"], callable_fraction=q["callable_fraction"],
                            target_status=q.get("target_inference", {}).get("status", ""),
                            target_start=q.get("target_inference", {}).get("start"),
-                           target_end=q.get("target_inference", {}).get("end"))
+                           target_end=q.get("target_inference", {}).get("end"),
+                           selected_reads=q.get("selected_reads", ""),
+                           polish_blockers=";".join(q.get("polish_blockers", [])),
+                           diagnostic_blockers=";".join(q.get("diagnostic", {}).get("blockers", [])))
                 if polish_eligible and sample not in pol:
                     raise ValueError(f"Missing consensus result for polish-eligible well: {sample}")
             if sample in pol:
                 p = json.loads(Path(pol[sample], "decision.json").read_text())
+                if sample not in qc or q["status"] == "REJECT":
+                    raise ValueError(f"Unexpected polishing result for unscreened/rejected well: {sample}")
                 combined_warnings = sorted(set(q_warnings) | set(p.get("warnings", [])))
                 row.update(status=p["status"], reasons=";".join(p["reasons"]),
                            warnings=";".join(combined_warnings))
@@ -608,6 +648,21 @@ def cmd_report(a):
                     if set(records) != {sample} or sample in review_seqs:
                         raise ValueError("Review consensus identifier collision")
                     review_seqs.update(records)
+                    diagnostic_seqs[sample] = records[sample]
+                    row.update(diagnostic_available=True, diagnostic_kind="DIAGNOSTIC_POLISHED",
+                               diagnostic_callable_fraction=1 - p["masked_bases"] / p["length"] if p.get("length") else "",
+                               diagnostic_blockers="")
+            # Exactly one diagnostic per REVIEW well: prefer polished, otherwise
+            # the independent masked draft. Never aggregate drafts for rejected wells.
+            if row["status"] == "REVIEW" and sample not in diagnostic_seqs and sample in qc:
+                diagnostic = q.get("diagnostic", {})
+                if diagnostic.get("eligible"):
+                    records = read_fasta(Path(qc[sample], "diagnostic_consensus.fasta"))
+                    if set(records) != {sample}:
+                        raise ValueError("Diagnostic consensus identifier collision")
+                    diagnostic_seqs.update(records)
+                    row.update(diagnostic_available=True, diagnostic_kind="DIAGNOSTIC_UNPOLISHED",
+                               diagnostic_callable_fraction=diagnostic["callable_fraction"])
             rows.append(row)
     rows.sort(key=lambda r: (r["batch"], r["well"][0], int(r["well"][1:])))
     with open("well_summary.tsv", "w") as handle:
@@ -616,14 +671,22 @@ def cmd_report(a):
             writer.writeheader()
             writer.writerows(rows)
     write_fasta("accepted_consensus.fasta", dict(sorted(seqs.items())))
-    write_fasta("review_consensus.fasta", dict(sorted(review_seqs.items())))
+    write_fasta("review_consensus.fasta", {f"{s} status=DIAGNOSTIC_POLISHED accepted=false": seq
+                                           for s, seq in sorted(review_seqs.items())})
+    by_sample = {r["sample"]: r for r in rows}
+    write_fasta("diagnostic_consensus.fasta", {
+        f"{s} status={by_sample[s]['diagnostic_kind']} accepted=false construct={by_sample[s]['dominant_construct']}": seq
+        for s, seq in sorted(diagnostic_seqs.items())})
     dump("run_summary.json", dict(wells=len(rows), accepted_consensuses=len(seqs),
           review_consensuses=len(review_seqs), statuses=dict(Counter(r["status"] for r in rows)),
+          diagnostic_consensuses=len(diagnostic_seqs),
+          diagnostic_kinds=dict(Counter(r["diagnostic_kind"] for r in rows if r["diagnostic_available"])),
           implementation_version=VERSION,
           batch_targets={r["batch"]: r for r in sorted(target_reports, key=lambda x: x["batch"])},
           note=("Exploratory mixture screening. CONSENSUS_PASS does not establish one physical template; "
-                "review_consensus.fasta is diagnostic and is not an accepted assay call.")))
-    print(f"Completed: {len(rows)} wells, {len(seqs)} accepted and {len(review_seqs)} review consensus sequences",
+                "diagnostic_consensus.fasta contains REVIEW wells only, preferring polished over unpolished drafts. "
+                "review_consensus.fasta is its polished subset. Neither is an accepted assay call.")))
+    print(f"Completed: {len(rows)} wells, {len(seqs)} accepted and {len(diagnostic_seqs)} diagnostic consensus sequences",
           file=sys.stderr)
 
 def main():
@@ -665,15 +728,22 @@ def main():
     pol.add_argument("--device", default="cpu")
     rep = sub.add_parser("report")
     rep.add_argument("--manifest", required=True)
+    evaluation = sub.add_parser("evaluate-assignment", help="Compare assignments without changing production QC")
+    for flag in ("manifest", "references", "reference-alignment", "settings", "outdir"):
+        evaluation.add_argument("--" + flag, required=True)
     for tool in (base, demux, trim, aln, pol):
         tool.add_argument("--dorado", default="dorado")
         tool.add_argument("--version", default="2.1.2")
-    for tool in (base, demux, trim, aln, qc, pol, inf):
+    for tool in (base, demux, trim, aln, qc, pol, inf, evaluation):
         tool.add_argument("--samtools", default="samtools")
         tool.add_argument("--threads", default="4")
     a = p.parse_args()
     try:
-        globals()["cmd_" + a.command.replace("-", "_")](a)
+        if a.command == "evaluate-assignment":
+            from tcr_pod5_assignment import evaluate_assignment
+            evaluate_assignment(a, alignments)
+        else:
+            globals()["cmd_" + a.command.replace("-", "_")](a)
     except (ValueError, OSError, RuntimeError, subprocess.CalledProcessError) as e:
         p.exit(1, f"ERROR: {e}\n")
 

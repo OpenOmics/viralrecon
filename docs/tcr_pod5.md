@@ -165,6 +165,9 @@ Examples of the **exploratory defaults**, not established sensitivity/specificit
 | Minimum support / callable fraction to attempt polishing | 20 reads / 80% |
 | Minimum read / base quality | Q10 / Q15 |
 | Competitive alignment identity / query coverage | 90% / 85%; no full-vector coverage requirement |
+| Internal deletion exemption from base-error identity | D >=50 bp, with >=20 contiguous aligned bases on each side |
+| Diagnostic draft support / per-position depth | 10 dominant reads / 10; at least 2 reads per strand |
+| Diagnostic draft callable fraction | >=10%; unsupported positions remain N |
 | Dominant-read target coverage for draft eligibility | 85% of the batch-inferred interval |
 | Mapping quality; alignment-score separation | 20; 20 |
 | Strong minor population | At least 5 reads and 10%, with at least 2 per strand |
@@ -177,6 +180,56 @@ The minority fraction is calculated among relevant assigned or informative reads
 `ambiguous_reference` reads remain excluded from construct evidence and consensus, but are reported separately rather than counted in the unresolved-fraction numerator because shared vector sequence can make otherwise good reads non-discriminating. A high primer-trim failure fraction is likewise retained as a warning; only successfully trimmed reads can enter downstream evidence.
 
 Polishing and acceptance are separate decisions. Expected constructs with an inferred interval may enter Dorado polish when at least 20 complete dominant reads remain, the draft is at least 80% callable, strand support is adequate, and there is no hard mixture/structural blocker. Final `CONSENSUS_PASS` still requires the configured 50-read support, depth/callable thresholds, coherent post-polish alignments, no fixed-indel disagreement, and no strong bidirectional non-homopolymer variation. A polished sequence that remains `REVIEW` is retained in `review_consensus.fasta` for inspection but is never added to `accepted_consensus.fasta`.
+
+### Deletions and assignment evaluation (v0.4.0)
+
+Long internal deletions are evaluated separately from base-error identity. For an alignment spanning `S` columns with `NM` edit bases and `D` qualifying deleted bases, the assignment identity is `(S - NM) / (S - D)`. Only CIGAR D operations at least `deletion_min_length=50` bp long with at least `deletion_min_anchor=20` contiguous aligned bases on **each** side qualify. Short or terminal deletions, insertions and substitutions remain penalties. These length/anchor defaults are exploratory. Read quality, query coverage, MAPQ, competitive score separation, and split-alignment checks still apply; a missing NM tag cannot imply a perfect match.
+
+This exemption retains candidates for evaluation; it does not certify the deletion. Deletion events still contribute to the well's heterogeneity and linked-haplotype evidence. A consistent, supported deletion is represented in the draft; intact/deleted subpopulations remain visible. A long deletion mixture is not downgraded to a homopolymer warning merely because its breakpoint is near a homopolymer. Equivalent repeat deletions are projected onto the normalized event coordinates so normalization does not introduce spurious masked bases. `qc/read_assignments.tsv` reports both identity calculations and the exempted deletion coordinates/lengths. Batch target inference still requires 3,000 query-aligned bases by default: a strongly deleted read can contribute to QC using an already inferred target without necessarily contributing endpoints to target inference.
+
+`evaluate-assignment` provides an **offline comparison**, without changing production assignments or acceptance rules. It compares the previous NM-based method, deletion-aware production assignment, and informative-position assignment. Use the full panel, including contamination sentinels. Supply a reference-only multiple alignment with exactly the original IDs and ungapped sequences; a mismatch fails validation.
+
+For example, align the reference panel once using MAFFT (an optional audit dependency, not required for the production workflow), and name-sort the existing per-well full-panel BAMs:
+
+```bash
+mafft --auto --thread 4 reference.fasta > reference_panel.aligned.fasta
+samtools sort -n -o A1.name_sorted.bam /results/tcr_pod5/Run1/wells/A1/alignment/aligned.bam
+```
+
+Create a JSON manifest listing **all wells being compared**, with paths accessible from the working directory:
+
+```json
+{
+  "batch": "Run1",
+  "alignments": [
+    {"well": "A1", "bam": "/absolute/path/A1.name_sorted.bam"},
+    {"well": "A2", "bam": "/absolute/path/A2.name_sorted.bam"}
+  ]
+}
+```
+
+```bash
+python3 bin/tcr_pod5.py evaluate-assignment \
+  --manifest assignment_inputs.json \
+  --references reference.fasta \
+  --reference-alignment reference_panel.aligned.fasta \
+  --settings assets/tcr_pod5/qc_defaults.json \
+  --outdir assignment_evaluation
+```
+
+The audit writes `read_assignment_comparison.tsv` and `assignment_evaluation.json`, including per-well counts, transitions, reference/alignment digests, and exact informative columns. Default informative criteria are identity >=0.75, a best-versus-second-best margin >=0.15, and at least 50 quality-filtered informative positions. Every candidate is scored over the **same observed positions**. Only variable columns containing A/C/G/T in every reference are used in this first implementation; gapped or N-containing variable columns are listed separately. Deleted read positions are missing nucleotide evidence, not mismatches or support for an alternative construct. Thus this audit need not reproduce the collaborator's count of 798 positions.
+
+Read bases are projected through the primary BAM alignment into the reference alignment; original reads and insertions are preserved. The alternative scoring omits MAPQ/AS and whole-read identity gates so it can examine reads rejected as ambiguous by the production method. Quality, query-coverage and split-alignment exclusions still apply. Primary placement in repeats can bias these scores, and a deleted insert may remove the ability to distinguish constructs. Inspect changed reads, sentinel assignments and known controls before adopting this method. Neither extra assignments nor fewer unresolved reads demonstrate improved accuracy. This is an evaluation of the informative-position approach, not an exact implementation of MAFFT read placement or an automatic rescue.
+
+### Diagnostic drafts (v0.4.0)
+
+Wells held for review can now produce a separate **unpolished, masked diagnostic draft**, even when they cannot enter Dorado polishing. Defaults require 10 complete, assigned dominant-construct reads, at least 2 on each strand, an inferred expected-construct target, and at least 10% callable target positions. At each called position, depth must be at least `diagnostic_min_depth=10`, base quality at least Q15, and support at least 80%. Strong candidate variation is additionally masked, including strong homopolymer-associated variation. No reference bases fill coverage gaps. The draft includes supported insertions/deletions; conflicting fixed indels block its output.
+
+These support levels are for inspecting the available evidence and are **not validated consensus accuracy thresholds**. Unresolved-read, endpoint, partial-read, split-read or weak second-construct flags remain in the decision; the draft represents only the selected dominant subset and does not resolve those concerns. Rejected mixtures, unexpected constructs, missing targets, inadequate support and conflicting indels do not receive a diagnostic draft. A zero-assignment well now has a null dominant construct instead of an arbitrary panel member.
+
+`qc/decision.json` records diagnostic eligibility, blockers, support, masking thresholds and original reasons. Its per-well draft is a pre-polish artifact. Final aggregation includes only wells whose final status is `REVIEW`, prefers the polished diagnostic when available, and otherwise uses the unpolished draft. It excludes later post-polish rejections even if a pre-polish draft exists. FASTA descriptions explicitly say `DIAGNOSTIC_UNPOLISHED` or `DIAGNOSTIC_POLISHED` and `accepted=false`. The TSV also records the kind, availability and callable fraction; this fraction can differ from the stricter pre-polish `callable_fraction` column. `usable_reads` remains the count assigned across all constructs; `selected_reads` identifies the complete dominant subset used for reconstruction.
+
+The accepted thresholds remain 50 reads, at least 5 per strand, depth 20, 80% base support and 98% callability. Strand support is rechecked after polishing, and post-polish linked haplotypes are a hard rejection. Strong candidate variation is masked in polished output too. Pre-polish biological/structural review reasons persist: losing the minor population during remapping is not evidence that a mixture was resolved. Only numerical support/coverage checks are reassessed. Diagnostic availability never changes a REVIEW well to `CONSENSUS_PASS`.
 
 **Limits:** identical templates are indistinguishable; low-abundance, closely related, or poorly sequenced mixtures can be missed; systematic ONT/PCR errors can cause review or false mixture signals. Complex rearrangements and repeat-associated indels require manual examination. This is a conservative candidate screen, not a validated haplotype caller, a phylogenetic proof of single-template origin, or a clinical pipeline. Do not use it to estimate the number of original molecules from sequencing read counts.
 
@@ -193,14 +246,16 @@ audit/                              POD5 inventory and raw UUID provenance
 <batch>/wells/<well>/alignment/      full-panel coordinate-sorted BAM and index
 <batch>/target_inference/targets/    inferred BED, JSON, summary TSV, read evidence
 <batch>/wells/<well>/heterogeneity/qc/
-                                    decision, assignment, allele/haplotype evidence
+                                    decision, assignment, allele/haplotype evidence,
+                                    optional masked diagnostic draft and mask BED
 <batch>/wells/<well>/consensus/consensus_result/
                                     post-polish decision and accepted/review sequence
 summary/                            well_summary.tsv, run_summary.json,
-                                    accepted_consensus.fasta, review_consensus.fasta
+                                    accepted_consensus.fasta, review_consensus.fasta,
+                                    diagnostic_consensus.fasta
 ```
 
-Every expected well appears in the final summary, including `NO_READS`. Mixed and review wells are excluded from `accepted_consensus.fasta` without deleting their evidence. Polished REVIEW wells are collected separately in `review_consensus.fasta` and remain diagnostic-only. An all-rejected run legitimately produces an empty accepted FASTA. IDs include batch and well to prevent collisions. Variant positions in heterogeneity QC refer to the **original full reference**, restricted to the inferred target. Draft sequences span that target. Masked-position BEDs refer to the **polished amplicon**, whose coordinates can differ after indels. `inferred_targets.json` records original-reference boundaries.
+Every expected well appears in the final summary, including `NO_READS`. Mixed and review wells are excluded from `accepted_consensus.fasta` without deleting their evidence. `diagnostic_consensus.fasta` contains one sequence per eligible final REVIEW well. `review_consensus.fasta` is its polished subset, retained for compatibility; do not concatenate the two files. An all-rejected run legitimately produces empty accepted and diagnostic FASTAs. IDs include batch and well to prevent collisions. Variant positions in heterogeneity QC refer to the **original full reference**, restricted to the inferred target. Draft sequences span that target. Each masked-position BED refers to its associated **output sequence after indels**, whose coordinates can differ from the reference. `inferred_targets.json` records original-reference boundaries.
 
 This branch produces TSV/JSON reports, not a customized MultiQC report or a final multiple-sequence alignment/tree. Those are separate extensions beyond the requested consensus gate.
 
@@ -221,6 +276,8 @@ python3 -m unittest discover -s tests/tcr_pod5 -v
 ```
 
 That test exercises **synthetic barcode classification and trimming only**, not POD5 basecalling or polishing. A successful result does not validate the full workflow or biological thresholds.
+
+The reconstruction regressions additionally cover large deletion retention, ordinary error penalties, repeat normalization, informative-site coverage/margins, low-depth masking, diagnostic/accepted output separation, and post-polish strand/linked-haplotype gates. Post-polish driver tests mock external commands; they do not exercise the Dorado model. The Run1 summary files alone cannot establish how many reads or wells these changes recover: rerun QC on the BAMs and compare the assignment audit before reporting a revised yield.
 
 Before broader use, perform a small POD5 end-to-end run on the cluster and challenge the QC with known clean controls and deliberate mixtures. The historical Run1 FASTA and well counts are comparison material, not established ground truth. A new basecaller and stricter index/primer matching can change counts. Historical renamed FASTA IDs do not automatically provide a UUID crosswalk for read-by-read comparison.
 

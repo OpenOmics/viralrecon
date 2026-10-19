@@ -11,12 +11,12 @@ import json
 import math
 import re
 from collections import Counter, defaultdict
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from itertools import combinations
 from pathlib import Path
 from typing import Iterable
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 DNA = set("ACGT")
 WELL = re.compile(r"[A-H](?:[1-9]|1[0-2])$")
 SAFE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*$")
@@ -26,7 +26,7 @@ def rc(s: str) -> str:
     return s.translate(str.maketrans("ACGTNacgtn", "TGCANtgcan"))[::-1]
 
 
-def read_fasta(path) -> dict[str, str]:
+def read_fasta(path, allow_gaps=False) -> dict[str, str]:
     seqs, name, parts = {}, None, []
     op = gzip.open if str(path).endswith(".gz") else open
     with op(path, "rt") as f:
@@ -48,8 +48,9 @@ def read_fasta(path) -> dict[str, str]:
         if name in seqs:
             raise ValueError(f"Duplicate FASTA ID: {name}")
         seqs[name] = "".join(parts).upper()
-    if not seqs or any(not s or set(s) - set("ACGTN") for s in seqs.values()):
-        raise ValueError("FASTA must contain nonempty A/C/G/T/N nucleotide records")
+    alphabet = set("ACGTN-" if allow_gaps else "ACGTN")
+    if not seqs or any(not s or set(s) - alphabet for s in seqs.values()):
+        raise ValueError("FASTA contains empty records or unsupported nucleotide symbols")
     return seqs
 
 
@@ -238,6 +239,15 @@ class Settings:
     min_baseq: int = 15
     min_read_q: float = 10.0
     min_identity: float = 0.90
+    deletion_min_length: int = 50
+    deletion_min_anchor: int = 20
+    informative_min_identity: float = 0.75
+    informative_min_margin: float = 0.15
+    informative_min_positions: int = 50
+    diagnostic_min_reads: int = 10
+    diagnostic_min_depth: int = 10
+    diagnostic_min_strand_reads: int = 2
+    diagnostic_min_callable_fraction: float = 0.10
     min_query_coverage: float = 0.85
     min_target_coverage: float = 0.85
     min_mapq: int = 20
@@ -282,6 +292,7 @@ class Settings:
         for key in ("min_identity", "min_query_coverage", "min_target_coverage", "minor_fraction",
                     "alert_fraction", "max_unresolved_fraction", "max_trim_fail_fraction",
                     "consensus_fraction", "min_callable_fraction", "polish_min_callable_fraction",
+                    "informative_min_identity", "informative_min_margin", "diagnostic_min_callable_fraction",
                     "target_min_query_coverage", "target_min_cluster_fraction"):
             if not 0 < getattr(obj, key) <= 1:
                 raise ValueError(f"QC option {key} must be in (0,1]")
@@ -290,7 +301,9 @@ class Settings:
         if obj.consensus_fraction <= 0.5 or obj.min_reads < 1 or obj.polish_min_reads < 1 or obj.min_depth < 1:
             raise ValueError("Invalid consensus or support thresholds")
         for key in ("target_min_reads", "target_min_wells", "target_min_reads_per_well",
-                    "target_min_each_strand", "target_min_alignment_length", "target_boundary_tolerance"):
+                    "target_min_each_strand", "target_min_alignment_length", "target_boundary_tolerance",
+                    "deletion_min_length", "deletion_min_anchor", "informative_min_positions",
+                    "diagnostic_min_reads", "diagnostic_min_depth", "diagnostic_min_strand_reads"):
             if getattr(obj, key) < 1:
                 raise ValueError(f"QC option {key} must be positive")
         if obj.target_min_cluster_fraction <= 0.5:
@@ -349,7 +362,41 @@ def mean_q(qual):
     return -10 * math.log10(sum(10 ** (-(ord(c) - 33) / 10) for c in qual) / len(qual))
 
 
-def assign(records: list[Sam], refs: dict[str, str], cfg: Settings, require_target_coverage=True):
+def alignment_identity(r: Sam, cfg: Settings):
+    """Keep long, internally anchored deletions separate from base-error identity.
+
+    Only D operations with contiguous aligned sequence on BOTH sides qualify.
+    Short/unanchored deletions, insertions and mismatches still count as errors.
+    This does not establish that the deletion is real; evidence() tests its support.
+    """
+    ops, deleted, pos = r.ops, [], r.start
+    span = sum(n for n, op in ops if op in "MID=X")
+    for i, (n, op) in enumerate(ops):
+        if op == "D" and n >= cfg.deletion_min_length:
+            anchors = []
+            for step in (-1, 1):
+                j, length = i + step, 0
+                while 0 <= j < len(ops) and ops[j][1] in "M=X":
+                    length += ops[j][0]
+                    j += step
+                anchors.append(length)
+            if min(anchors) >= cfg.deletion_min_anchor:
+                deleted.append((pos, n))
+        if op in "MDN=X":
+            pos += n
+    exempt = sum(n for _, n in deleted)
+    # Missing NM is never silently interpreted as a perfect alignment.
+    errors = int(r.tags.get("NM", span))
+    if not 0 <= errors <= span or errors < sum(n for n, op in ops if op in "ID"):
+        raise ValueError(f"Inconsistent NM/CIGAR for read {r.name}")
+    matches = span - errors
+    return dict(raw_identity=matches / max(1, span),
+                deletion_aware_identity=matches / max(1, span - exempt),
+                exempt_deleted_bases=exempt, internal_deletions=deleted)
+
+
+def assign(records: list[Sam], refs: dict[str, str], cfg: Settings, require_target_coverage=True,
+           deletion_aware=True):
     primary = [r for r in records if not r.flag & (256 | 2048)]
     if len(primary) != 1:
         raise ValueError(f"Expected one primary alignment per read: {records[0].name}")
@@ -367,8 +414,8 @@ def assign(records: list[Sam], refs: dict[str, str], cfg: Settings, require_targ
     if "N" in r.cigar:
         return "split_alignment", None
     aligned = sum(n for n, op in r.ops if op in "MI=X")
-    span = sum(n for n, op in r.ops if op in "MID=X")
-    identity = 1 - int(r.tags.get("NM", span)) / max(1, span)
+    metrics = alignment_identity(r, cfg)
+    identity = metrics["deletion_aware_identity" if deletion_aware else "raw_identity"]
     if identity < cfg.min_identity:
         return "low_identity", None
     if aligned / max(1, len(r.seq)) < cfg.min_query_coverage:
@@ -397,7 +444,7 @@ def normalize_event(kind, pos, seq, ref):
 
 
 def observations(r: Sam, ref: str, cfg: Settings):
-    q, p, bases, events = 0, r.start, {}, {}
+    q, p, bases, events, deletions = 0, r.start, {}, {}, []
     if r.qual == "*":
         return bases, events
     qs = [ord(x) - 33 for x in r.qual]
@@ -417,6 +464,7 @@ def observations(r: Sam, ref: str, cfg: Settings):
             if q > 0 and q < len(qs) and min(qs[q - 1], qs[q]) >= cfg.min_baseq:
                 ev = normalize_event("D", p, ref[p:p + n], ref)
                 events[ev] = True
+                deletions.append((p, n, ev[1]))
                 for k in range(n):
                     bases[p + k] = "-"
             p += n
@@ -426,6 +474,18 @@ def observations(r: Sam, ref: str, cfg: Settings):
             q += n
         elif op in "HP":
             pass
+    # Project equivalent repeat deletions onto the same coordinates as their
+    # normalized event. Otherwise the draft deletes one position but masks another.
+    for original, length, normalized in deletions:
+        if normalized < original:
+            shifted = {p + length: bases.get(p) for p in range(normalized, original)}
+            for p, base in shifted.items():
+                if base in DNA:
+                    bases[p] = base
+                else:
+                    bases.pop(p, None)
+            for p in range(normalized, normalized + length):
+                bases[p] = "-"
     return bases, events
 
 
@@ -434,7 +494,7 @@ def low_complexity(ref, pos, n):
     return any(base * n in s for base in DNA)
 
 
-def evidence(reads: list[Sam], ref: str, cfg: Settings, interval=None):
+def evidence(reads: list[Sam], ref: str, cfg: Settings, interval=None, mask_variation=False):
     """Evaluate bases in a fixed target interval; report original-reference coordinates."""
     start, end = interval if interval is not None else (0, len(ref))
     if not 0 <= start < end <= len(ref):
@@ -481,7 +541,8 @@ def evidence(reads: list[Sam], ref: str, cfg: Settings, interval=None):
             minor = min(counts.values())
             if minor >= cfg.alert_reads and minor / sum(counts.values()) >= cfg.alert_fraction:
                 sites.append(dict(kind=kind, pos=pos, sequence=seq, alleles=dict(counts), calls=calls,
-                                  homopolymer=low_complexity(ref, pos, cfg.homopolymer_length)))
+                                  homopolymer=(not (kind == "D" and len(seq) >= cfg.deletion_min_length)
+                                               and low_complexity(ref, pos, cfg.homopolymer_length))))
     # Annotate every sensitive candidate site with the stronger, strand-balanced
     # evidence used for consensus blocking. Candidate detection remains intentionally
     # sensitive (alert_reads / alert_fraction); acceptance uses the stronger rule.
@@ -521,10 +582,19 @@ def evidence(reads: list[Sam], ref: str, cfg: Settings, interval=None):
                                   reads1=len(ids1), reads2=len(ids2), informative_reads=n))
     # A conservative draft, based on high-quality reads only, never reference fill.
     draft, callable_count = [], 0
+    forced_mask = set()
+    if mask_variation:
+        for site in sites:
+            if site.get("strong_minor"):
+                length = len(site["sequence"]) if site["kind"] == "D" else (2 if site["kind"] == "I" else 1)
+                forced_mask.update(range(site["pos"], site["pos"] + length))
     fixed = []
     for event, calls in event_support:
         counts = Counter(calls.values())
-        if sum(counts.values()) >= cfg.min_depth and counts["ALT"] / sum(counts.values()) >= cfg.consensus_fraction:
+        kind, pos, sequence = event
+        affected = set(range(pos, pos + (len(sequence) if kind == "D" else 2)))
+        if (not affected & forced_mask and sum(counts.values()) >= cfg.min_depth
+                and counts["ALT"] / sum(counts.values()) >= cfg.consensus_fraction):
             fixed.append(event)
     deleted, insertions, conflicts = set(), {}, False
     for kind, pos, seq in fixed:
@@ -545,7 +615,7 @@ def evidence(reads: list[Sam], ref: str, cfg: Settings, interval=None):
         counts = Counter(pile.get(p, {}).values())
         depth = sum(counts.values())
         base, n = counts.most_common(1)[0] if counts else ("N", 0)
-        called = depth >= cfg.min_depth and n / max(1, depth) >= cfg.consensus_fraction
+        called = p not in forced_mask and depth >= cfg.min_depth and n / max(1, depth) >= cfg.consensus_fraction
         if p in deleted:
             if called and base == "-":
                 callable_count += 1
@@ -561,7 +631,8 @@ def evidence(reads: list[Sam], ref: str, cfg: Settings, interval=None):
             draft.append(insertions[p])
     return dict(sites=sites, links=links, pile=pile, events=event_support,
                 draft="".join(draft), callable_fraction=callable_count / (end - start),
-                conflicting_fixed_indels=conflicts, strands=strands)
+                conflicting_fixed_indels=conflicts, strands=strands,
+                masked_variation_positions=sorted(forced_mask))
 
 
 def screen(assignments, assigned_reads, refs, cfg: Settings, trim_stats=None,
@@ -570,11 +641,11 @@ def screen(assignments, assigned_reads, refs, cfg: Settings, trim_stats=None,
     counts = Counter(assignments)
     construct_counts = {k: counts.get(k, 0) for k in refs}
     ranked = sorted(construct_counts, key=lambda k: (-construct_counts[k], k))
-    dominant = ranked[0]
+    dominant = ranked[0] if construct_counts[ranked[0]] else None
     n_assigned = sum(construct_counts.values())
     total = sum(counts.values())
     reasons, warnings, strong_mixture = [], [], []
-    if total < cfg.min_reads or construct_counts[dominant] < cfg.min_reads:
+    if total < cfg.min_reads or construct_counts.get(dominant, 0) < cfg.min_reads:
         reasons.append("LOW_SUPPORT")
     for ref in ranked[1:]:
         n = construct_counts[ref]
@@ -606,10 +677,10 @@ def screen(assignments, assigned_reads, refs, cfg: Settings, trim_stats=None,
             warnings.append("WARN_PRIMER_TRIMMING")
 
     selected = [r for r in assigned_reads if r.ref == dominant]
-    target = targets.get(dominant) if targets is not None else (0, len(refs[dominant]))
+    target = (targets.get(dominant) if targets is not None else (0, len(refs[dominant]))) if dominant else None
     target_partial_reads = 0
     target_boundary_outlier_reads = 0
-    if expected_constructs is not None and construct_counts[dominant] and dominant not in expected_constructs:
+    if expected_constructs is not None and dominant and dominant not in expected_constructs:
         reasons.append("REVIEW_UNEXPECTED_CONSTRUCT")
     if target is None:
         reasons.append("REVIEW_TARGET_NOT_INFERRED")
@@ -682,6 +753,7 @@ def screen(assignments, assigned_reads, refs, cfg: Settings, trim_stats=None,
     report = dict(status=status, reasons=sorted(set(reasons)), warnings=sorted(set(warnings)),
                   polish_eligible=polish_eligible, polish_blockers=sorted(set(polish_blockers)),
                   dominant_construct=dominant, total_reads=total, assigned_reads=n_assigned,
+                  selected_reads=len(selected),
                   construct_counts=construct_counts,
                   unresolved_counts={k: v for k, v in counts.items() if k not in refs},
                   ambiguous_reference_reads=ambiguous_reference_reads,
@@ -698,3 +770,37 @@ def screen(assignments, assigned_reads, refs, cfg: Settings, trim_stats=None,
                   interpretation=("Polish eligibility permits reconstruction of some REVIEW wells; "
                                   "CONSENSUS_PASS remains a separate post-polish acceptance decision."))
     return report, ev, selected
+
+
+def diagnostic_consensus(report, reads, refs, cfg: Settings):
+    """Masked, unpolished draft only. Never changes the well's acceptance decision."""
+    blockers = [r for r in report["reasons"] if r.startswith("REJECT")]
+    for reason in ("REVIEW_TARGET_NOT_INFERRED", "REVIEW_UNEXPECTED_CONSTRUCT", "REVIEW_CONFLICTING_INDELS"):
+        if reason in report["reasons"]:
+            blockers.append(reason)
+    if report["status"] == "REJECT" and not blockers:
+        blockers.append("REJECT")
+    if not report.get("dominant_construct") or not report.get("target_interval"):
+        blockers.append("DIAGNOSTIC_NO_TARGET")
+    if len(reads) < cfg.diagnostic_min_reads:
+        blockers.append("DIAGNOSTIC_LOW_SUPPORT")
+    strands = Counter(r.strand for r in reads)
+    if min(strands.get("+", 0), strands.get("-", 0)) < cfg.diagnostic_min_strand_reads:
+        blockers.append("DIAGNOSTIC_STRAND_SUPPORT")
+    ev = None
+    if not blockers:
+        ev = evidence(reads, refs[report["dominant_construct"]],
+                      replace(cfg, min_depth=cfg.diagnostic_min_depth),
+                      report["target_interval"], mask_variation=True)
+        if ev["conflicting_fixed_indels"]:
+            blockers.append("DIAGNOSTIC_CONFLICTING_INDELS")
+        if ev["callable_fraction"] < cfg.diagnostic_min_callable_fraction or not set(ev["draft"]) & DNA:
+            blockers.append("DIAGNOSTIC_INCOMPLETE_COVERAGE")
+    detail = dict(eligible=not blockers, blockers=sorted(set(blockers)),
+                  kind="DIAGNOSTIC_UNPOLISHED", accepted=False, selected_reads=len(reads),
+                  strand_counts=dict(strands), min_depth=cfg.diagnostic_min_depth,
+                  min_baseq=cfg.min_baseq, base_support=cfg.consensus_fraction,
+                  callable_fraction=ev["callable_fraction"] if ev else None,
+                  source_reasons=report["reasons"], source_warnings=report["warnings"],
+                  interpretation="Dominant-construct subset only; masked draft, not a validated single-template call")
+    return detail, ev["draft"] if ev and not blockers else None
