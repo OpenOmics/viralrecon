@@ -6,6 +6,12 @@ include {
     TCR_POD5_AUDIT; TCR_PREPARE; TCR_DORADO_BASECALL; TCR_DORADO_DEMUX;
     TCR_DORADO_TRIM; TCR_ALIGN; TCR_INFER_TARGETS; TCR_WELL_QC; TCR_DORADO_POLISH; TCR_REPORT
 } from '../modules/local/tcr_pod5/main'
+include { TCR_MULTIQC } from '../modules/local/tcr_multiqc/main'
+
+// Pass only the report inputs, never BAM/POD5 files or a published results tree.
+def tcrReportFiles(prefix, directory, names) {
+    names.collect { name -> tuple("${prefix}/${name}".toString(), directory.resolve(name)) }
+}
 
 def localPath(base, value) {
     if (!value || value.toString().contains('\n') || value.toString().contains('\r'))
@@ -128,6 +134,56 @@ workflow TCR_POD5 {
         tooling
     )
 
+    ch_multiqc = Channel.empty()
+    if (!params.skip_multiqc) {
+        def report_tools = Channel.value(file("${projectDir}/assets/tcr_pod5/multiqc", checkIfExists: true))
+        ch_multiqc_inputs = TCR_POD5_AUDIT.out.report
+            .map { p -> tuple('audit/pod5_audit.json', p) }
+            .mix(TCR_PREPARE.out.scheme.flatMap { meta, scheme ->
+                tcrReportFiles("${meta.id}/scheme/scheme", scheme,
+                    ['scheme.json', 'reference.fasta', 'barcodes.toml'])
+            })
+            .mix(TCR_DORADO_BASECALL.out.provenance.map { p ->
+                def batch = new JsonSlurper().parseText(p.text).batch
+                if (!(batch ==~ /[A-Za-z0-9][A-Za-z0-9_.-]*/)) error 'Invalid batch in basecall provenance'
+                tuple("${batch}/basecalling/basecall_provenance.json".toString(), p)
+            })
+            .mix(TCR_DORADO_DEMUX.out.result.flatMap { meta, demux, scheme ->
+                tcrReportFiles("${meta.id}/demultiplexing/demux", demux,
+                    ['manifest.json', 'settings.json', 'dorado_sequencing_summary.txt'])
+            })
+            .mix(TCR_DORADO_TRIM.out.reads.map { meta, clean, trim, refs ->
+                tuple("${meta.batch}/wells/${meta.well}/trimming/trim_stats.json".toString(), trim)
+            })
+            .mix(TCR_INFER_TARGETS.out.result.flatMap { meta, targets ->
+                tcrReportFiles("${meta.id}/target_inference/targets", targets, ['inferred_targets.json'])
+            })
+            .mix(TCR_WELL_QC.out.report.flatMap { meta, qc ->
+                tcrReportFiles("${meta.batch}/wells/${meta.well}/heterogeneity/qc", qc,
+                    ['decision.json', 'read_assignments.tsv'])
+            })
+            .mix(TCR_DORADO_POLISH.out.report.flatMap { meta, polished ->
+                tcrReportFiles("${meta.batch}/wells/${meta.well}/consensus/consensus_result", polished,
+                    ['decision.json'])
+            })
+            .mix(TCR_REPORT.out.table.map { p -> tuple('summary/well_summary.tsv', p) })
+            .mix(TCR_REPORT.out.json.map { p -> tuple('summary/run_summary.json', p) })
+            .mix(TCR_REPORT.out.consensus.map { p -> tuple('summary/accepted_consensus.fasta', p) })
+            .mix(TCR_REPORT.out.review_consensus.map { p -> tuple('summary/review_consensus.fasta', p) })
+            .mix(TCR_REPORT.out.diagnostic_consensus.map { p -> tuple('summary/diagnostic_consensus.fasta', p) })
+            // collect waits for every source, including optional/empty polishing channels.
+            .collect(flat: false)
+            .map { rows ->
+                def ordered = rows.sort { a, b -> a[0] <=> b[0] }
+                def destinations = ordered.collect { it[0] }
+                if (destinations.unique(false).size() != destinations.size())
+                    error 'Duplicate destination in TCR MultiQC inputs'
+                tuple(destinations, ordered.collect { it[1] })
+            }
+        TCR_MULTIQC(ch_multiqc_inputs, report_tools)
+        ch_multiqc = TCR_MULTIQC.out.report
+    }
+
     emit:
     inferred_targets = TCR_INFER_TARGETS.out.result
     well_summary = TCR_REPORT.out.table
@@ -135,4 +191,5 @@ workflow TCR_POD5 {
     review_consensus = TCR_REPORT.out.review_consensus
     diagnostic_consensus = TCR_REPORT.out.diagnostic_consensus
     summary = TCR_REPORT.out.json
+    multiqc = ch_multiqc
 }
