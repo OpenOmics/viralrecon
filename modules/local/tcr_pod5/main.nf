@@ -179,8 +179,7 @@ process TCR_WELL_QC {
 process TCR_DORADO_POLISH {
     tag "${meta.id}"
     label 'tcr_polish'
-    publishDir { "${params.outdir}/tcr_pod5/${meta.batch}/wells/${meta.well}/consensus" }, mode: 'copy',
-        pattern: 'consensus_result'
+    publishDir { "${params.outdir}/tcr_pod5/${meta.batch}/wells/${meta.well}/consensus" }, mode: 'copy'
     input:
     tuple val(meta), path(passed), path(clean)
     path models
@@ -188,6 +187,8 @@ process TCR_DORADO_POLISH {
     path tooling
     output:
     tuple val(meta), path('consensus_result'), emit: report
+    // Required outputs survive task-local scratch and permit exact post-polish audits.
+    tuple val(meta), path('polished.fasta'), path('polished_aligned.bam'), path('polished_aligned.bam.bai'), emit: evidence
     script:
     """
     python3 tcr_pod5.py polish --bam ${tq(clean)} --passed ${tq(passed)} \\
