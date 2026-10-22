@@ -229,7 +229,37 @@ These support levels are for inspecting the available evidence and are **not val
 
 `qc/decision.json` records diagnostic eligibility, blockers, support, masking thresholds and original reasons. Its per-well draft is a pre-polish artifact. Final aggregation includes only wells whose final status is `REVIEW`, prefers the polished diagnostic when available, and otherwise uses the unpolished draft. It excludes later post-polish rejections even if a pre-polish draft exists. FASTA descriptions explicitly say `DIAGNOSTIC_UNPOLISHED` or `DIAGNOSTIC_POLISHED` and `accepted=false`. The TSV also records the kind, availability and callable fraction; this fraction can differ from the stricter pre-polish `callable_fraction` column. `usable_reads` remains the count assigned across all constructs; `selected_reads` identifies the complete dominant subset used for reconstruction.
 
-The accepted thresholds remain 50 reads, at least 5 per strand, depth 20, 80% base support and 98% callability. Strand support is rechecked after polishing, and post-polish linked haplotypes are a hard rejection. Strong candidate variation is masked in polished output too. Pre-polish biological/structural review reasons persist: losing the minor population during remapping is not evidence that a mixture was resolved. Only numerical support/coverage checks are reassessed. Diagnostic availability never changes a REVIEW well to `CONSENSUS_PASS`.
+The accepted thresholds remain 50 reads, at least 5 per strand, depth 20, 80% base support and 98% callability. Strand support is rechecked after polishing, and post-polish linked haplotypes are a hard rejection. Strong candidate variation is masked in polished output too. Biological/structural review reasons persist. Starting with v0.4.1, the original within-construct SNP flag can be resolved only by the evidence checks described below; losing the minor population during remapping cannot resolve it. Diagnostic availability itself never changes a REVIEW well to `CONSENSUS_PASS`.
+
+### Split-read review rule (v0.4.1)
+
+`REVIEW_SPLIT_ALIGNMENTS` and `REVIEW_POSTPOLISH_SPLIT_ALIGNMENTS` now require **both** `split_reads >= alert_reads` and `split_reads / evaluated_reads >= alert_fraction`. The existing defaults are 3 reads and 0.03 (3%). For example, 3 split reads out of 1,000 do not raise the split-read review flag; 3 out of 100 do. Other review and rejection checks still apply.
+
+The denominator is all read IDs evaluated at that stage, including unassigned reads: all primer-passing reads at initial QC, and all selected input reads represented in the alignment to the polished sequence at final QC. Each read ID is counted once even when it has supplementary or secondary records. This fraction is not calculated from the selected non-split subset, the number of SAM records, or raw POD5 reads.
+
+**Split reads are always excluded from reconstruction and consensus evidence.** Supplementary alignments, SA tags and reference-skipping CIGAR N operations still cause read-level exclusion. The split reads still contribute to `unresolved_for_qc`, so the separate unresolved-fraction gate is unchanged. Above-threshold pre-polish split evidence remains a polishing blocker; the rule does not rescue a flagged well by dropping those reads and reevaluating only the remaining subset.
+
+Both decision JSONs record a `split_alignment_qc` block with the count, denominator, fraction, configured thresholds and review result. MultiQC sections 08 and 09 display the recorded count, percentage and denominator; older reports leave those fields blank. To replace an old count-only decision, rerun initial QC and downstream processing with this code rather than editing the published decision or regenerating MultiQC alone.
+
+### Reassessing an original variation flag (v0.4.1)
+
+The existing QC and polishing steps now track `REVIEW_WITHIN_CONSTRUCT_VARIATION` through reconstruction. This adds no Nextflow process or alignment command and requires no new option. The SNP reassessment does not alter the configured screening, assignment, depth, quality or allele-fraction thresholds; the separate split-read rule above changes how the existing alert thresholds are combined.
+
+When the initial screen raises this reason, `qc/decision.json` records a `variation_evidence` block. It contains the original blocking sites, nucleotide-supporting read IDs and query positions, sequence anchors, and fingerprints of the full selected cohort's IDs, sequences and qualities. The same report travels to polishing in `pass/decision.json`. Read fingerprints use the original sequencing orientation, so SAM reverse-complement representation does not count as a basecall change.
+
+The final check uses the existing alignment to the raw polished sequence and the same evidence used for final masking. Resolution requires all of the following:
+
+- Every original selected read is still present, has unchanged sequence/quality, and passes post-alignment assignment filters. This first implementation deliberately requires exact cohort retention.
+- Every original blocking site is accounted for. Automatic reassessment currently supports SNPs with trackable query bases and unique, unchanged 40-base flanks within the inferred target. Indel flags, sites too near a target end, missing metadata and ambiguous coordinate mappings remain under review.
+- The affected repeat and 30 bases on each side map unambiguously into the polished sequence. Every position in that window must meet the configured depth and consensus-support requirements and remain unmasked in the final output.
+- Every original SNP-supporting base can be followed through the new CIGAR as an evaluated match, mismatch or insertion in that window. Clipped, lost, masked or otherwise unevaluable support prevents resolution.
+- No post-polish blocking variation or linked haplotypes remain. A zero blocking-site count alone is insufficient.
+
+Only when every original site resolves is this reason removed from the active `reasons` list. The original `pre_screen_reasons` remain recorded; `resolved_reasons` and `variation_reassessment` explain the decision, including mapped regions, support metrics and tracked-base destinations. All other final acceptance gates still apply, including masked fraction, strand/read support and fixed-indel disagreement. A resolved flag may therefore coexist with a final `REVIEW` caused by another reason. Masks outside the reassessed regions are preserved and count toward the existing whole-sequence coverage gate.
+
+`well_summary.tsv` includes `resolved_reasons` and `variation_reassessment`; `run_summary.json` counts resolved review reasons. The existing MultiQC post-polish validation table displays the same fields. These are pipeline decisions, not classifications invented by the report collector.
+
+Older QC reports lack the necessary evidence and cannot automatically clear the flag. Rerun QC and polishing with the updated code, using a fresh output directory to keep old review FASTAs separate from newly accepted outputs. The workflow stages its shared Python tooling into upstream tasks as well, so do not assume `-resume` will rerun only QC and polishing after this code change.
 
 **Limits:** identical templates are indistinguishable; low-abundance, closely related, or poorly sequenced mixtures can be missed; systematic ONT/PCR errors can cause review or false mixture signals. Complex rearrangements and repeat-associated indels require manual examination. This is a conservative candidate screen, not a validated haplotype caller, a phylogenetic proof of single-template origin, or a clinical pipeline. Do not use it to estimate the number of original molecules from sequencing read counts.
 
@@ -257,7 +287,7 @@ summary/                            well_summary.tsv, run_summary.json,
 
 Every expected well appears in the final summary, including `NO_READS`. Mixed and review wells are excluded from `accepted_consensus.fasta` without deleting their evidence. `diagnostic_consensus.fasta` contains one sequence per eligible final REVIEW well. `review_consensus.fasta` is its polished subset, retained for compatibility; do not concatenate the two files. An all-rejected run legitimately produces empty accepted and diagnostic FASTAs. IDs include batch and well to prevent collisions. Variant positions in heterogeneity QC refer to the **original full reference**, restricted to the inferred target. Draft sequences span that target. Each masked-position BED refers to its associated **output sequence after indels**, whose coordinates can differ from the reference. `inferred_targets.json` records original-reference boundaries.
 
-This branch produces TSV/JSON reports, not a customized MultiQC report or a final multiple-sequence alignment/tree. Those are separate extensions beyond the requested consensus gate.
+This branch produces TSV/JSON reports and a customized MultiQC report; see [TCR MultiQC](tcr_multiqc.md). A final multiple-sequence alignment/tree remains a separate downstream analysis.
 
 ## 8. Validation and interpretation
 
@@ -278,6 +308,8 @@ python3 -m unittest discover -s tests/tcr_pod5 -v
 That test exercises **synthetic barcode classification and trimming only**, not POD5 basecalling or polishing. A successful result does not validate the full workflow or biological thresholds.
 
 The reconstruction regressions additionally cover large deletion retention, ordinary error penalties, repeat normalization, informative-site coverage/margins, low-depth masking, diagnostic/accepted output separation, and post-polish strand/linked-haplotype gates. Post-polish driver tests mock external commands; they do not exercise the Dorado model. The Run1 summary files alone cannot establish how many reads or wells these changes recover: rerun QC on the BAMs and compare the assignment audit before reporting a revised yield.
+
+The reassessment regressions exercise the actual QC, polishing-decision and aggregation functions on artificial reads: a dominant-deletion alignment artifact resolves, persistent bidirectional SNP populations remain under review, and missing/filtered/changed reads, masking, inadequate local depth, incomplete site evidence and ambiguous mappings prevent resolution. They also check that unrelated reasons and masks outside the audited region are preserved. Split-read regressions check both alert thresholds and their boundaries, unique-read denominators, retained unresolved-read accounting and exclusion from consensus depth at both stages. A supporting read becoming split cannot resolve an original SNP flag even when the new split fraction is below the alert threshold. External alignment/polishing calls are mocked; these are not an end-to-end Dorado or Nextflow validation.
 
 Before broader use, perform a small POD5 end-to-end run on the cluster and challenge the QC with known clean controls and deliberate mixtures. The historical Run1 FASTA and well counts are comparison material, not established ground truth. A new basecaller and stricter index/primer matching can change counts. Historical renamed FASTA IDs do not automatically provide a UUID crosswalk for read-by-read comparison.
 

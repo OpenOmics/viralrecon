@@ -315,12 +315,13 @@ class PostPolishTests(unittest.TestCase):
             self.assertIn('REVIEW_POSTPOLISH_STRAND_SUPPORT', report['reasons'])
             self.assertFalse(Path('consensus_result/consensus.fasta').exists())
 
-    def test_polishing_cannot_clear_preexisting_mixture_evidence(self):
+    def test_legacy_variation_flag_without_evidence_stays_under_review(self):
         with tempfile.TemporaryDirectory() as tmp, working(tmp):
             reads = [replace(r, ref='sample') for r in population(60)]
             report = self.polish(reads, ['REVIEW_WITHIN_CONSTRUCT_VARIATION'])
             self.assertEqual(report['status'], 'REVIEW')
             self.assertIn('REVIEW_WITHIN_CONSTRUCT_VARIATION', report['reasons'])
+            self.assertEqual(report['variation_reassessment']['barriers'], ['MISSING_OR_UNSUPPORTED_ORIGINAL_EVIDENCE'])
             self.assertFalse(Path('consensus_result/consensus.fasta').exists())
 
     def test_linked_minor_population_rejects_even_when_marginal_sites_are_weak(self):

@@ -7,6 +7,7 @@ No statistical confidence level or detection limit is implied by the thresholds.
 from __future__ import annotations
 import csv
 import gzip
+import hashlib
 import json
 import math
 import re
@@ -16,7 +17,7 @@ from itertools import combinations
 from pathlib import Path
 from typing import Iterable
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 DNA = set("ACGT")
 WELL = re.compile(r"[A-H](?:[1-9]|1[0-2])$")
 SAFE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*$")
@@ -635,6 +636,228 @@ def evidence(reads: list[Sam], ref: str, cfg: Settings, interval=None, mask_vari
                 masked_variation_positions=sorted(forced_mask))
 
 
+VARIATION_REASON = "REVIEW_WITHIN_CONSTRUCT_VARIATION"
+
+
+def _digest_json(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _read_cohort(reads):
+    """Fingerprint read IDs and unchanged sequence/quality in sequencing orientation."""
+    ordered = sorted(reads, key=lambda r: r.name)
+    if len({r.name for r in ordered}) != len(ordered):
+        raise ValueError("Duplicate selected read ID")
+    digest = hashlib.sha256()
+    for r in ordered:
+        if r.seq == "*" or r.qual == "*" or len(r.seq) != len(r.qual):
+            raise ValueError("Selected read lacks sequence or quality")
+        seq, qual = (rc(r.seq), r.qual[::-1]) if r.flag & 16 else (r.seq, r.qual)
+        digest.update((r.name + "\0" + seq + "\0" + qual + "\n").encode())
+    return dict(reads=len(ordered), ids_sha256=_digest_json([r.name for r in ordered]),
+                sequence_quality_sha256=digest.hexdigest())
+
+
+def _unique_position(sequence, fragment):
+    pos = sequence.find(fragment)
+    return pos if pos >= 0 and sequence.find(fragment, pos + 1) < 0 else None
+
+
+def _query_at_reference(read, position):
+    p, q = read.start, 0
+    for n, op in read.ops:
+        if op in "M=X" and p <= position < p + n:
+            return q + position - p
+        if op in "MDN=X":
+            p += n
+        if op in "MIS=X":
+            q += n
+    return None
+
+
+def _project_query(read, query, sequence):
+    p, q = read.start, 0
+    for n, op in read.ops:
+        if op in "MIS=X" and q <= query < q + n:
+            base = read.seq[query]
+            if op == "S":
+                return dict(kind="SOFT_CLIPPED")
+            pos = p - 1 if op == "I" else p + query - q
+            kind = "INSERTION" if op == "I" else (
+                "MASKED_REFERENCE" if not 0 <= pos < len(sequence) or sequence[pos] not in DNA else
+                "MATCH" if base == sequence[pos] else "MISMATCH")
+            return dict(kind=kind, position_0based=pos, base=base, base_quality=ord(read.qual[query]) - 33)
+        if op in "MDN=X":
+            p += n
+        if op in "MIS=X":
+            q += n
+    return dict(kind="QUERY_BASE_NOT_FOUND")
+
+
+def capture_variation_evidence(reads, ref, interval, ev, cfg):
+    """Record blocking SNP evidence for later reassessment, without changing QC."""
+    start, end = interval
+    by_id = {r.name: r for r in reads}
+    record = dict(schema_version=1, settings_sha256=_digest_json(asdict(cfg)),
+                  reference_sha256=hashlib.sha256(ref.encode()).hexdigest(),
+                  target_interval=list(interval), cohort=_read_cohort(reads), sites=[])
+    for site in ev["sites"]:
+        if not site.get("blocking_variation"):
+            continue
+        pos = site["pos"]
+        item = dict(kind=site["kind"], position_0based=pos, alleles=site["alleles"],
+                    issues=[], supporting_bases=[])
+        record["sites"].append(item)
+        if site["kind"] != "SNP":
+            item["issues"].append("UNSUPPORTED_SITE_TYPE")
+            continue
+        # Enclose the whole repeat so an equivalent left-normalized deletion
+        # never requires guessing which indistinguishable base was removed.
+        left, right = pos, pos + 1
+        while left > start and ref[left - 1] == ref[pos]:
+            left -= 1
+        while right < end and ref[right] == ref[pos]:
+            right += 1
+        anchor, padding = 40, 30  # Coordinate anchors, not biological QC thresholds.
+        if left - anchor < start or right + anchor > end:
+            item["issues"].append("INSUFFICIENT_FLANKING_CONTEXT")
+        else:
+            a, b = ref[left-anchor:left], ref[right:right+anchor]
+            if (set(a + b) - DNA or _unique_position(ref[start:end], a) is None
+                    or _unique_position(ref[start:end], b) is None):
+                item["issues"].append("NONUNIQUE_OR_MASKED_ORIGINAL_ANCHORS")
+            else:
+                item.update(left_anchor=a, right_anchor=b, original_repeat_interval=[left, right],
+                            original_window=[left-padding, right+padding], window_padding=padding)
+        for rid, base in sorted(site["calls"].items()):
+            read = by_id[rid]
+            q = _query_at_reference(read, pos)
+            # Normalization can move an observation. Only track a base when its
+            # actual query position reproduces the recorded original SNP call.
+            if q is None or read.seq[q] != base or ord(read.qual[q]) - 33 < cfg.min_baseq:
+                item["issues"].append("ORIGINAL_QUERY_BASE_NOT_TRACKABLE")
+                continue
+            item["supporting_bases"].append(dict(read_id=rid, base=base, strand=read.strand,
+                                                forward_query_index=len(read.seq)-1-q if read.flag & 16 else q))
+        item["issues"] = sorted(set(item["issues"]))
+    return record
+
+
+def reassess_variation(screen_report, groups, reads, sequence, ev, masked, cfg):
+    """Resolve only fully observed original SNP flags; never clear other reasons."""
+    result = dict(schema_version=1, reason=VARIATION_REASON, status="NOT_APPLICABLE", barriers=[], sites=[])
+    if VARIATION_REASON not in screen_report.get("reasons", []):
+        return result
+    result["status"] = "RETAINED"
+    original = screen_report.get("variation_evidence")
+    if not original or original.get("schema_version") != 1:
+        result["barriers"] = ["MISSING_OR_UNSUPPORTED_ORIGINAL_EVIDENCE"]
+        return result
+    barriers = result["barriers"]
+    if original.get("settings_sha256") != _digest_json(asdict(cfg)):
+        barriers.append("QC_SETTINGS_CHANGED")
+    sites = original.get("sites", [])
+    if not sites or len(sites) != screen_report.get("blocking_variation_sites"):
+        barriers.append("INCOMPLETE_ORIGINAL_SITE_EVIDENCE")
+    if screen_report.get("linked_haplotypes") or ev["links"]:
+        barriers.append("LINKED_HAPLOTYPES")
+    if any(s.get("blocking_variation") for s in ev["sites"]):
+        barriers.append("POSTPOLISH_BLOCKING_VARIATION")
+    primary = [r for records in groups.values() for r in records if not r.flag & (256 | 2048)]
+    if len(primary) != len(groups) or len({r.name for r in primary}) != len(groups):
+        barriers.append("AMBIGUOUS_PRIMARY_ALIGNMENT")
+    try:
+        observed, eligible = _read_cohort(primary), _read_cohort(reads)
+        result.update(original_cohort=original.get("cohort"), observed_cohort=observed,
+                      eligible_reads=eligible["reads"])
+        if observed != original.get("cohort"):
+            barriers.append("READ_COHORT_OR_BASECALLS_CHANGED")
+        if eligible != original.get("cohort"):
+            barriers.append("ORIGINAL_READS_NOT_ALL_ELIGIBLE")
+    except ValueError:
+        barriers.append("READ_DATA_UNAVAILABLE")
+    if barriers:
+        return result
+    by_id = {r.name: r for r in reads}
+    mask = set(masked)
+    for site in sites:
+        detail = dict(kind=site.get("kind"), original_position_0based=site.get("position_0based"),
+                      original_alleles=site.get("alleles"), status="RETAINED",
+                      barriers=list(site.get("issues", [])))
+        result["sites"].append(detail)
+        problems = detail["barriers"]
+        if site.get("kind") != "SNP":
+            problems.append("UNSUPPORTED_SITE_TYPE")
+        support = site.get("supporting_bases", [])
+        if (not support or len({s["read_id"] for s in support}) != len(support)
+                or dict(Counter(s["base"] for s in support)) != site.get("alleles")):
+            problems.append("INCOMPLETE_ORIGINAL_SUPPORT")
+        a, b = site.get("left_anchor"), site.get("right_anchor")
+        left = _unique_position(sequence, a) if a else None
+        right = _unique_position(sequence, b) if b else None
+        if left is None or right is None or left + len(a) > right:
+            problems.append("REGION_NOT_UNIQUELY_MAPPED")
+        if problems:
+            detail["barriers"] = sorted(set(problems))
+            continue
+        left += len(a)
+        padding = site["window_padding"]
+        lo, hi = left-padding, right+padding
+        if not 0 <= lo < hi <= len(sequence):
+            problems.append("REGION_OUTSIDE_POLISHED_SEQUENCE")
+            continue
+        detail.update(polished_repeat_interval=[left, right], polished_window=[lo, hi],
+                      masked_positions=[p for p in range(lo, hi) if p in mask or sequence[p] not in DNA])
+        if detail["masked_positions"]:
+            problems.append("MASKED_AUDITED_REGION")
+        depths, fractions, low = [], [], []
+        for pos in range(lo, hi):
+            counts = Counter(ev["pile"].get(pos, {}).values())
+            depth = sum(counts.values())
+            fraction = counts[sequence[pos]] / max(1, depth)
+            depths.append(depth)
+            fractions.append(fraction)
+            if depth < cfg.min_depth or fraction < cfg.consensus_fraction:
+                low.append(pos)
+        detail.update(minimum_depth=min(depths), minimum_reference_support=min(fractions), low_support_positions=low)
+        if low:
+            problems.append("INSUFFICIENT_LOCAL_SUPPORT")
+        tracked = []
+        for supporting in support:
+            rid = supporting["read_id"]
+            read = by_id.get(rid)
+            q = supporting["forward_query_index"]
+            if read is None or not 0 <= q < len(read.seq):
+                problems.append("ORIGINAL_SUPPORT_NOT_EVALUABLE")
+                continue
+            query = len(read.seq)-1-q if read.flag & 16 else q
+            projection = _project_query(read, query, sequence)
+            tracked.append(dict(read_id=rid, **projection))
+            lower = lo-1 if projection["kind"] == "INSERTION" else lo
+            if (projection["kind"] not in ("MATCH", "MISMATCH", "INSERTION")
+                    or projection.get("base_quality", -1) < cfg.min_baseq
+                    or not lower <= projection.get("position_0based", -1) < hi):
+                problems.append("ORIGINAL_SUPPORT_NOT_EVALUABLE")
+        detail.update(tracked_bases=tracked, projection_counts=dict(Counter(p["kind"] for p in tracked)))
+        detail["barriers"] = sorted(set(problems))
+        if not problems:
+            detail["status"] = "RESOLVED"
+    if len(result["sites"]) == len(sites) and all(s["status"] == "RESOLVED" for s in result["sites"]):
+        result["status"] = "RESOLVED"
+    else:
+        result["barriers"] = ["ORIGINAL_SITES_NOT_ALL_RESOLVED"]
+    return result
+
+
+def split_alignment_summary(counts, cfg: Settings):
+    """Stage-local read counts, with one assignment per read ID (not per SAM record)."""
+    n, total = counts.get("split_alignment", 0), sum(counts.values())
+    fraction = n / max(1, total)
+    return dict(reads=n, total_reads=total, fraction=fraction,
+                min_reads=cfg.alert_reads, min_fraction=cfg.alert_fraction,
+                review=n >= cfg.alert_reads and fraction >= cfg.alert_fraction)
+
+
 def screen(assignments, assigned_reads, refs, cfg: Settings, trim_stats=None,
            targets=None, expected_constructs=None):
     """Return (report, evidence, selected reads). Never claim physical template count."""
@@ -669,7 +892,8 @@ def screen(assignments, assigned_reads, refs, cfg: Settings, trim_stats=None,
         warnings.append("WARN_AMBIGUOUS_REFERENCE")
     if unresolved_for_qc / max(1, total) > cfg.max_unresolved_fraction:
         reasons.append("REVIEW_UNRESOLVED_READS")
-    if counts.get("split_alignment", 0) >= cfg.alert_reads:
+    split_qc = split_alignment_summary(counts, cfg)
+    if split_qc["review"]:
         reasons.append("REVIEW_SPLIT_ALIGNMENTS")
     if trim_stats:
         n, failed = trim_stats["input_reads"], trim_stats["failed_reads"]
@@ -758,6 +982,7 @@ def screen(assignments, assigned_reads, refs, cfg: Settings, trim_stats=None,
                   unresolved_counts={k: v for k, v in counts.items() if k not in refs},
                   ambiguous_reference_reads=ambiguous_reference_reads,
                   unresolved_for_qc=unresolved_for_qc,
+                  split_alignment_qc=split_qc,
                   strand_counts=dict(strands), callable_fraction=ev["callable_fraction"],
                   candidate_sites=len(ev["sites"]), strong_candidate_sites=len(strong_sites),
                   blocking_variation_sites=len(blocking_sites), linked_haplotypes=ev["links"],
@@ -769,6 +994,8 @@ def screen(assignments, assigned_reads, refs, cfg: Settings, trim_stats=None,
                   settings=asdict(cfg), software_version=VERSION,
                   interpretation=("Polish eligibility permits reconstruction of some REVIEW wells; "
                                   "CONSENSUS_PASS remains a separate post-polish acceptance decision."))
+    if VARIATION_REASON in reasons:
+        report["variation_evidence"] = capture_variation_evidence(selected, refs[dominant], target, ev, cfg)
     return report, ev, selected
 
 

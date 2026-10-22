@@ -22,9 +22,10 @@ from collections import Counter, defaultdict
 
 from tcr_pod5_targets import Endpoint, infer_targets, load_intervals, target_candidate
 
-from tcr_pod5_core import (VERSION, Settings, Sam, alignment_identity, assign, build_scheme,
+from tcr_pod5_core import (VERSION, VARIATION_REASON, Settings, Sam, alignment_identity, assign, build_scheme,
                             diagnostic_consensus, evidence,
-                            full_primer_match, rc, read_fasta, screen, write_fasta)
+                            full_primer_match, rc, read_fasta, reassess_variation, screen,
+                            split_alignment_summary, write_fasta)
 
 
 def dump(path, obj):
@@ -534,10 +535,12 @@ def cmd_polish(a):
         if sum(counts.values()) >= cfg.min_depth and counts["ALT"] / sum(counts.values()) >= cfg.consensus_fraction:
             fixed_indels.append(event)
 
-    # Polishing cannot establish that a pre-existing biological mixture disappeared.
-    # Only numerical support/coverage checks may be replaced by post-polish checks.
+    # Numerical gates are recalculated below. A historical SNP flag is resolved
+    # only after the original reads, query bases and unmasked regions are checked.
+    variation_reassessment = reassess_variation(screen_report, groups, reads, seq, ev, masked, cfg)
+    resolved_reasons = [VARIATION_REASON] if variation_reassessment["status"] == "RESOLVED" else []
     reassessed = {"LOW_SUPPORT", "LOW_TARGET_SUPPORT", "REVIEW_STRAND_SUPPORT", "REVIEW_INCOMPLETE_COVERAGE"}
-    reasons = [r for r in screen_report.get("reasons", []) if r not in reassessed]
+    reasons = [r for r in screen_report.get("reasons", []) if r not in reassessed and r not in resolved_reasons]
     warnings = []
     ambiguous_reference_reads = post_status.get("ambiguous_reference", 0)
     unresolved_for_qc = sum(post_status.values()) - len(reads) - ambiguous_reference_reads
@@ -545,7 +548,8 @@ def cmd_polish(a):
         warnings.append("WARN_POSTPOLISH_AMBIGUOUS_REFERENCE")
     if unresolved_for_qc / max(1, sum(post_status.values())) > cfg.max_unresolved_fraction:
         reasons.append("REVIEW_POSTPOLISH_ALIGNMENTS")
-    if post_status.get("split_alignment", 0) >= cfg.alert_reads:
+    split_qc = split_alignment_summary(post_status, cfg)
+    if split_qc["review"]:
         reasons.append("REVIEW_POSTPOLISH_SPLIT_ALIGNMENTS")
     if ev["links"]:
         reasons.append("REJECT_POSTPOLISH_LINKED_HAPLOTYPES")
@@ -573,14 +577,16 @@ def cmd_polish(a):
             handle.write(f"{a.sample}\t{pos}\t{pos + 1}\n")
     output_seq = "".join(output)
     status = "REJECT" if any(r.startswith("REJECT") for r in reasons) else ("REVIEW" if reasons else "CONSENSUS_PASS")
-    report = dict(sample=a.sample, status=status,
+    report = dict(sample=a.sample, status=status, software_version=VERSION,
                   reasons=sorted(set(reasons)), warnings=sorted(set(warnings)),
+                  resolved_reasons=resolved_reasons, variation_reassessment=variation_reassessment,
                   masked_bases=len(masked), length=len(seq), basecall_model=model,
                   residual_fixed_indels=fixed_indels, alignment_counts=dict(post_status), dorado_version=a.version,
                   candidate_sites=len(ev["sites"]), strong_candidate_sites=len(strong_sites),
                   blocking_variation_sites=len(blocking_sites),
                   ambiguous_reference_reads=ambiguous_reference_reads,
                   unresolved_for_qc=unresolved_for_qc,
+                  split_alignment_qc=split_qc,
                   selected_reads=len(reads), strand_counts=dict(strands), linked_haplotypes=ev["links"],
                   pre_screen_status=screen_report.get("status"),
                   pre_screen_reasons=screen_report.get("reasons", []),
@@ -612,7 +618,8 @@ def cmd_report(a):
                        polish_eligible=False, dominant_construct="", usable_reads=0, callable_fraction="",
                        target_status="", target_start="", target_end="", selected_reads=0,
                        polish_blockers="", diagnostic_available=False, diagnostic_kind="",
-                       diagnostic_callable_fraction="", diagnostic_blockers="")
+                       diagnostic_callable_fraction="", diagnostic_blockers="",
+                       resolved_reasons="", variation_reassessment="")
             q_warnings = []
             if item["reads"] and sample not in qc:
                 raise ValueError(f"Missing well QC result: {sample}")
@@ -637,7 +644,9 @@ def cmd_report(a):
                     raise ValueError(f"Unexpected polishing result for unscreened/rejected well: {sample}")
                 combined_warnings = sorted(set(q_warnings) | set(p.get("warnings", [])))
                 row.update(status=p["status"], reasons=";".join(p["reasons"]),
-                           warnings=";".join(combined_warnings))
+                           warnings=";".join(combined_warnings),
+                           resolved_reasons=";".join(p.get("resolved_reasons", [])),
+                           variation_reassessment=p.get("variation_reassessment", {}).get("status", ""))
                 if p["status"] == "CONSENSUS_PASS":
                     records = read_fasta(Path(pol[sample], "consensus.fasta"))
                     if set(records) != {sample} or sample in seqs:
@@ -681,6 +690,8 @@ def cmd_report(a):
           review_consensuses=len(review_seqs), statuses=dict(Counter(r["status"] for r in rows)),
           diagnostic_consensuses=len(diagnostic_seqs),
           diagnostic_kinds=dict(Counter(r["diagnostic_kind"] for r in rows if r["diagnostic_available"])),
+          resolved_review_reasons=dict(Counter(reason for row in rows
+                                              for reason in row["resolved_reasons"].split(";") if reason)),
           implementation_version=VERSION,
           batch_targets={r["batch"]: r for r in sorted(target_reports, key=lambda x: x["batch"])},
           note=("Exploratory mixture screening. CONSENSUS_PASS does not establish one physical template; "

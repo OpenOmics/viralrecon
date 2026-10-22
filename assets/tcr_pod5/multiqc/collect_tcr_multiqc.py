@@ -21,7 +21,7 @@ from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 GROUPS = {
     "00": "Overview across steps",
     "01": "POD5 input audit",
@@ -52,6 +52,9 @@ LABELS = {
     "assigned_reads": "Panel-assigned reads", "unresolved_for_qc": "Unresolved for QC",
     "ambiguous_reference_reads": "Ambiguous reference reads", "both_ends": "Both ends required",
     "raw_identity": "Raw alignment identity", "deletion_aware_identity": "Deletion-aware identity",
+    "resolved_reasons": "Resolved review reasons", "variation_reassessment": "Original variation reassessment",
+    "split_alignment_reads": "Split reads", "split_alignment_pct": "Split reads (%)",
+    "split_alignment_total_reads": "Reads evaluated for split fraction",
 }
 HELP = {
     "raw_assigned_reads": "Reads assigned to this well by production Dorado demultiplexing, before primer/QC filters.",
@@ -62,6 +65,11 @@ HELP = {
     "diagnostic_pct": "Callable percentage of the diagnostic sequence actually selected by the pipeline report.",
     "review_consensuses": "Subset of all diagnostic sequences; do not add these two counts together.",
     "unresolved_for_qc": "Unresolved reads used by the mixture/QC gate; ambiguous-reference reads are treated separately.",
+    "resolved_reasons": "Historical review reasons resolved by recorded post-polish evidence; other acceptance checks still apply.",
+    "variation_reassessment": "RESOLVED, RETAINED or NOT_APPLICABLE for the original variation flag. Blank means an older report did not record this check.",
+    "split_alignment_reads": "Read IDs classified as split alignments at this stage; excluded from consensus even below the review thresholds.",
+    "split_alignment_pct": "100 × split reads / all read IDs evaluated at this stage, including unassigned reads. Blank in older reports without split_alignment_qc.",
+    "split_alignment_total_reads": "Stage-specific denominator: all trimmed read IDs at initial QC; the selected input cohort realigned to the polished sequence at final QC. Supplementary records do not add reads.",
 }
 FILTER_NAMES = {
     "primer_errors": "maximum full-primer edits", "primer_window": "primer search window (nt)",
@@ -74,8 +82,8 @@ FILTER_NAMES = {
     "min_depth": "minimum per-position depth", "min_baseq": "minimum base Q",
     "consensus_fraction": "minimum base-support fraction", "min_callable_fraction": "minimum callable target fraction",
     "minor_reads": "minimum minor-construct reads", "minor_fraction": "minimum minor-construct fraction",
-    "minor_each_strand": "minimum minor-construct reads on each strand", "alert_reads": "minor-signal alert read count",
-    "alert_fraction": "minor-signal alert fraction", "phase_spacing": "minimum phased-site spacing (nt)",
+    "minor_each_strand": "minimum minor-construct reads on each strand", "alert_reads": "minor-construct / split-read alert count",
+    "alert_fraction": "minor-construct / split-read alert fraction", "phase_spacing": "minimum phased-site spacing (nt)",
     "max_unresolved_fraction": "maximum unresolved fraction for QC", "min_target_coverage": "minimum target coverage",
     "polish_min_reads": "minimum selected reads to attempt polishing", "polish_min_callable_fraction": "minimum callable fraction to attempt polishing",
     "diagnostic_min_reads": "minimum reads for an unpolished diagnostic", "diagnostic_min_strand_reads": "minimum diagnostic reads on each strand",
@@ -678,6 +686,9 @@ class Report:
             if not q:
                 continue
             qc_rows[key] = {"screen_status": q.get("status"), **{k: q.get(k) for k in ("dominant_construct", "selected_reads", "candidate_sites", "strong_candidate_sites", "blocking_variation_sites", "target_partial_reads", "target_boundary_outlier_reads", "polish_eligible")},
+                            "split_alignment_reads": q.get("split_alignment_qc", {}).get("reads"),
+                            "split_alignment_pct": pct(q.get("split_alignment_qc", {}).get("fraction")),
+                            "split_alignment_total_reads": q.get("split_alignment_qc", {}).get("total_reads"),
                             "linked_haplotype_groups": len(q["linked_haplotypes"]) if isinstance(q.get("linked_haplotypes"), list) else None,
                             "callable_pct": pct(q.get("callable_fraction")), "reasons": "; ".join(q.get("reasons", [])), "warnings": "; ".join(q.get("warnings", []))}
             if "strand_counts" in q:
@@ -692,6 +703,8 @@ class Report:
                  "Screens construct mixtures, strand-supported minor alleles, linked variation, target support and consensus callability. "
                  "A strong minor construct needs the minimum count, fraction and support on each strand; smaller signals can trigger REVIEW. "
                  "An ambiguous reference assignment is excluded from consensus and reported separately from unresolved_for_qc. "
+                 "From v0.4.1, split-read REVIEW requires both alert_reads and alert_fraction of all read IDs evaluated at this stage. "
+                 "All split reads remain excluded from consensus and included in unresolved_for_qc. "
                  "Screening cannot establish that a PCR well started from one physical template."
                  + self.filters(["minor_reads", "minor_fraction", "minor_each_strand", "alert_reads", "alert_fraction", "phase_spacing", "max_unresolved_fraction", "min_target_coverage"]))
         self.add("08", "polish_eligibility", "Polishing eligibility", blockers,
@@ -736,10 +749,15 @@ class Report:
             if p:
                 polished[key] = {k: p.get(k) for k in ("status", "length", "masked_bases", "candidate_sites", "strong_candidate_sites", "blocking_variation_sites", "ambiguous_reference_reads", "unresolved_for_qc")}
                 polished[key].update(polish_selected_reads=p.get("selected_reads"),
+                                     split_alignment_reads=p.get("split_alignment_qc", {}).get("reads"),
+                                     split_alignment_pct=pct(p.get("split_alignment_qc", {}).get("fraction")),
+                                     split_alignment_total_reads=p.get("split_alignment_qc", {}).get("total_reads"),
                                      post_callable_pct=ratio(p["length"] - p["masked_bases"], p["length"]) if p.get("length") and p.get("masked_bases") is not None else None,
                                      plus=p["strand_counts"].get("+", 0) if "strand_counts" in p else None,
                                      minus=p["strand_counts"].get("-", 0) if "strand_counts" in p else None,
                                      residual_fixed_indels=len(p["residual_fixed_indels"]) if isinstance(p.get("residual_fixed_indels"), list) else None,
+                                     resolved_reasons="; ".join(p.get("resolved_reasons", [])),
+                                     variation_reassessment=p.get("variation_reassessment", {}).get("status", ""),
                                      reasons="; ".join(p.get("reasons", [])), warnings="; ".join(p.get("warnings", [])))
             if s or q:
                 d = (q or {}).get("diagnostic", {})
@@ -752,8 +770,12 @@ class Report:
         self.add("09", "polished", "Post-polish validation", polished,
                  "Realigns selected reads to a draft, runs Dorado polish, realigns again and repeats the QC checks. "
                  "Low-depth, low-support and problematic positions are masked. Persistent biological blockers remain relevant. "
+                 "An earlier SNP variation flag can resolve only when the original reads and supporting bases remain evaluable, "
+                 "every affected region is uniquely mapped and unmasked with sufficient support, and blocking variation is absent. "
+                 "From v0.4.1, the post-polish split-read flag also requires both alert thresholds, using all read IDs evaluated in this realignment. "
+                 "Split reads remain excluded from consensus and included in unresolved_for_qc. "
                  "The table uses the final polishing decision; per-well overview callability remains explicitly pre-polish."
-                 + self.filters(["min_reads", "min_strand_reads", "min_depth", "min_baseq", "consensus_fraction", "min_callable_fraction"]))
+                 + self.filters(["min_reads", "min_strand_reads", "min_depth", "min_baseq", "consensus_fraction", "min_callable_fraction", "alert_reads", "alert_fraction"]))
         self.add("10", "diagnostics", "Masked diagnostic sequences", diagnostic,
                  "Non-rejected REVIEW wells may supply a clearly labelled masked sequence for investigation. "
                  "The final report prefers a polished diagnostic over an eligible unpolished draft and exports at most one diagnostic per well. "

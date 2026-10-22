@@ -94,6 +94,37 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(r.availability["batch_one / A2"]["trim"], "MISSING")
         self.assertEqual(r.availability["batch_one / A3"]["trim"], "NOT EXPECTED")
 
+    def test_resolved_variation_is_visible_without_reclassifying_reports(self):
+        path = self.root / "batch_one/wells/A1/consensus/consensus_result/decision.json"
+        post = json.loads(path.read_text())
+        post.update(resolved_reasons=["REVIEW_WITHIN_CONSTRUCT_VARIATION"],
+                    variation_reassessment={"status": "RESOLVED"})
+        put(path, post)
+        r = self.build()
+        rows = r.data["tcr_09_polished"]["data"]
+        self.assertEqual(rows["batch_one / A1"]["resolved_reasons"], "REVIEW_WITHIN_CONSTRUCT_VARIATION")
+        self.assertEqual(rows["batch_one / A1"]["variation_reassessment"], "RESOLVED")
+        self.assertEqual(rows["batch_one / A1"]["status"], post["status"])
+        self.assertEqual(rows["batch_one / A2"]["variation_reassessment"], "")
+        self.assertEqual(rows["batch_one / A2"]["status"], "REVIEW")
+
+    def test_split_counts_are_stage_specific_and_missing_values_stay_blank(self):
+        wd = self.root / "batch_one/wells/A1"
+        for path, count, total in ((wd / "heterogeneity/qc/decision.json", 3, 1000),
+                                   (wd / "consensus/consensus_result/decision.json", 4, 200)):
+            report = json.loads(path.read_text())
+            report["split_alignment_qc"] = {"reads": count, "total_reads": total, "fraction": count / total}
+            put(path, report)
+        r = self.build()
+        for section, count, total, percent in (("tcr_08_qc", 3, 1000, .3),
+                                              ("tcr_09_polished", 4, 200, 2.0)):
+            rows = r.data[section]["data"]
+            self.assertEqual(rows["batch_one / A1"]["split_alignment_reads"], count)
+            self.assertEqual(rows["batch_one / A1"]["split_alignment_total_reads"], total)
+            self.assertEqual(rows["batch_one / A1"]["split_alignment_pct"], percent)
+            self.assertIsNone(rows["batch_one / A2"].get("split_alignment_pct"))
+        self.assertEqual(r.data["tcr_09_polished"]["data"]["batch_one / A1"]["status"], "CONSENSUS_PASS")
+
     def test_batch_selection_and_whole_run_totals(self):
         self.args.batch = ["batch_two"]
         r = self.build()
