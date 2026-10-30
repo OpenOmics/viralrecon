@@ -1,0 +1,22 @@
+# collect_tcr_multiqc.py appends the measured custom_data to this configuration.
+# Change report appearance here; no pipeline settings or calls are changed.
+title: "ONT TCR · Pipeline QC"
+subtitle: "Production results, delivered consensuses, and recorded settings"
+intro_text: "Read counts, per-well QC and consensus outcomes. Blank cells mean unavailable, not zero."
+report_comment: "Diagnostic consensuses are exploratory. A pipeline pass does not prove a single physical template."
+show_analysis_paths: false
+skip_generalstats: true
+run_modules:
+  - custom_content
+plots_force_interactive: true
+table_columns_visible: {}
+export_plots: false
+table_cond_formatting_rules:
+  all_columns:
+    pass:
+      - s_eq: CONSENSUS_PASS
+    warn:
+      - s_eq: REVIEW
+      - s_eq: MISSING
+    fail:
+      - s_eq: REJECT
