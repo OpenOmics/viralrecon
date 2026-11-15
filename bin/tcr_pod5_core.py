@@ -17,7 +17,7 @@ from itertools import combinations
 from pathlib import Path
 from typing import Iterable
 
-VERSION = "0.4.1"
+VERSION = "0.4.2"
 DNA = set("ACGT")
 WELL = re.compile(r"[A-H](?:[1-9]|1[0-2])$")
 SAFE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*$")
@@ -694,11 +694,217 @@ def _project_query(read, query, sequence):
     return dict(kind="QUERY_BASE_NOT_FOUND")
 
 
+def _local_sequence(read, left, right):
+    """CIGAR-bounded allele, including every insertion between the flanking bases.
+
+    Flanks need to be aligned, not exact sequence matches. Retain low-quality
+    observations for the independent unfiltered check; never call a skipped or
+    unobserved interval reference. Query coordinates use sequencing orientation.
+    """
+    if read.flag & (4 | 256 | 2048) or any(op in "NH" for _, op in read.ops):
+        return dict(status="UNSUPPORTED_ALIGNMENT")
+    a, b = _query_at_reference(read, left - 1), _query_at_reference(read, right)
+    if a is None or b is None or not 0 <= a < b < len(read.seq):
+        return dict(status="BOUNDARY_NOT_OBSERVED")
+    if read.qual == "*" or len(read.qual) != len(read.seq):
+        return dict(status="QUALITY_UNAVAILABLE")
+    if set(read.seq[a:b+1]) - DNA:
+        return dict(status="AMBIGUOUS_BASE")
+    forward = [len(read.seq)-b, len(read.seq)-a-1] if read.flag & 16 else [a+1, b]
+    return dict(status="OK", sequence=read.seq[a+1:b], strand=read.strand,
+                minimum_quality=min(map(ord, read.qual[a:b+1]))-33,
+                forward_query_interval=forward)
+
+
+def _indel_query_flanks(read, event, ref):
+    """Track the physical bases bracketing the original, normalized ALT event."""
+    q, p, matches = 0, read.start, []
+    for n, op in read.ops:
+        if op == event[0]:
+            seq = read.seq[q:q+n] if op == "I" else ref[p:p+n]
+            pos = p-1 if op == "I" else p
+            if seq and normalize_event(op, pos, seq, ref) == event:
+                flanks = [q-1, q+n if op == "I" else q]
+                if all(0 <= x < len(read.seq) for x in flanks):
+                    matches.append([len(read.seq)-1-x if read.flag & 16 else x for x in flanks])
+        if op in "MDN=X":
+            p += n
+        if op in "MIS=X":
+            q += n
+    return matches[0] if len(matches) == 1 else []
+
+
+def _capture_indel_regions(reads, ref, interval, sites, cfg):
+    """Share complete local contexts across overlapping short indel flags."""
+    start, end = interval
+    runs = [(m.start(), m.end()) for m in re.finditer(r"A{2,}|C{2,}|G{2,}|T{2,}", ref)]
+    spans = []
+    for index, site in enumerate(sites):
+        if site["kind"] not in ("I", "D"):
+            continue
+        if len(site["sequence"]) >= cfg.deletion_min_length:
+            site["issues"].append("STRUCTURAL_INDEL_NOT_REASSESSED")
+            continue
+        left = site["position_0based"] + (site["kind"] == "I")
+        right = left + (len(site["sequence"]) if site["kind"] == "D" else 0)
+        # Include runs touching either boundary, including an adjacent repeat of
+        # a different base. This is coordinate definition, not a homopolymer waiver.
+        changed = True
+        while changed:
+            changed = False
+            for a, b in runs:
+                if a <= right and b >= left and (a < left or b > right):
+                    left, right = min(left, a), max(right, b)
+                    changed = True
+        spans.append((left, right, index))
+    merged = []
+    for left, right, index in sorted(spans):
+        if merged and left <= merged[-1][1]:
+            merged[-1][1] = max(right, merged[-1][1])
+            merged[-1][2].append(index)
+        else:
+            merged.append([left, right, [index]])
+    regions = []
+    for left, right, indexes in merged:
+        rid = f"indel_{len(regions)+1}"
+        region = dict(region_id=rid, original_interval=[left, right],
+                      reference_sequence=ref[left:right], issues=[], window_padding=30)
+        regions.append(region)
+        for index in indexes:
+            sites[index]["region_id"] = rid
+        if right-left >= cfg.deletion_min_length:
+            region["issues"].append("COMPLEX_REGION_NOT_REASSESSED")
+        if not start <= left-40 <= right+40 <= end:
+            region["issues"].append("INSUFFICIENT_FLANKING_CONTEXT")
+        else:
+            a, b = ref[left-40:left], ref[right:right+40]
+            if (set(a+b) - DNA or _unique_position(ref[start:end], a) is None
+                    or _unique_position(ref[start:end], b) is None):
+                region["issues"].append("NONUNIQUE_OR_MASKED_ORIGINAL_ANCHORS")
+            else:
+                region.update(left_anchor=a, right_anchor=b)
+        if not region["issues"]:
+            region["observations"] = {r.name: _local_sequence(r, left, right) for r in reads}
+    return regions
+
+
+def _compare_local_sequences(before, after, polished_allele, cfg):
+    """Use a shared callable population, plus a conservative unfiltered guard.
+
+    An unobserved or differently bounded read contributes to the *alternative*
+    upper bound, never to reference support. Q0 counts are a guard against
+    quality-dependent selection, not high-quality consensus evidence.
+    """
+    raw, callable_counts = Counter(), Counter()
+    raw_strands, callable_strands = defaultdict(Counter), defaultdict(Counter)
+    exclusions, unobservable_ids, changed_ids = Counter(), [], []
+    for rid in sorted(before.keys() | after.keys()):
+        a, b = before.get(rid, {}), after.get(rid, {})
+        reason = None
+        if a.get("status") != "OK" or b.get("status") != "OK":
+            reason = "UNOBSERVABLE_BEFORE_OR_AFTER"
+        elif any(a.get(key) != b.get(key) for key in
+                 ("forward_query_interval", "sequence", "strand", "minimum_quality")):
+            reason = "LOCAL_OBSERVATION_CHANGED"
+        if reason:
+            exclusions[reason] += 1
+            (changed_ids if reason == "LOCAL_OBSERVATION_CHANGED" else unobservable_ids).append(rid)
+            continue
+        allele, strand = a["sequence"], a["strand"]
+        raw[allele] += 1
+        raw_strands[allele][strand] += 1
+        if a["minimum_quality"] < cfg.min_baseq:
+            exclusions["LOW_LOCAL_BASE_QUALITY"] += 1
+            continue
+        callable_counts[allele] += 1
+        callable_strands[allele][strand] += 1
+    total = len(before.keys() | after.keys())
+    n = sum(callable_counts.values())
+    other = n - callable_counts[polished_allele]
+    # Every competing sequence counts, including individually subthreshold ones.
+    upper = total - raw[polished_allele]
+    strand_totals = Counter()
+    for counts in callable_strands.values():
+        strand_totals.update(counts)
+    problems = []
+    if n < cfg.min_depth or min(strand_totals.get("+", 0), strand_totals.get("-", 0)) < cfg.min_strand_reads:
+        problems.append("INSUFFICIENT_SHARED_CALLABLE_SUPPORT")
+    if callable_counts[polished_allele] / max(1, n) < cfg.consensus_fraction:
+        problems.append("LOCAL_ALLELE_DISAGREES_WITH_POLISHED_SEQUENCE")
+    # More conservative than a strand-balanced single-site test: do not resolve
+    # a historical flag if the sum of competing alleles reaches minor_fraction.
+    if other / max(1, n) >= cfg.minor_fraction:
+        problems.append("COMPETING_LOCAL_ALLELES")
+    if upper / max(1, total) >= cfg.minor_fraction:
+        problems.append("UNFILTERED_ALTERNATIVE_BOUND")
+    return dict(polished_allele=polished_allele, cohort_reads=total,
+                observable_reads=sum(raw.values()), callable_reads=n,
+                excluded_reads=total-n, exclusion_counts=dict(exclusions),
+                unobservable_read_ids=unobservable_ids,
+                changed_local_observation_ids=changed_ids,
+                unfiltered_alleles=dict(raw), unfiltered_allele_strands=dict(raw_strands),
+                callable_alleles=dict(callable_counts), callable_allele_strands=dict(callable_strands),
+                callable_strands=dict(strand_totals), non_polished_callable_reads=other,
+                non_polished_callable_fraction=other/max(1, n),
+                unfiltered_alternative_upper_count=upper,
+                unfiltered_alternative_upper_fraction=upper/max(1, total),
+                min_baseq=cfg.min_baseq, minor_fraction=cfg.minor_fraction, barriers=problems)
+
+
+def _reassess_indel_region(region, reads, sequence, ev, masked, cfg):
+    detail = dict(region_id=region["region_id"], status="RETAINED", barriers=list(region["issues"]))
+    problems = detail["barriers"]
+    before = region.get("observations", {})
+    if set(before) != {r.name for r in reads}:
+        problems.append("INCOMPLETE_ORIGINAL_LOCAL_OBSERVATIONS")
+    a, b = region.get("left_anchor"), region.get("right_anchor")
+    left = _unique_position(sequence, a) if a else None
+    right = _unique_position(sequence, b) if b else None
+    if left is None or right is None or left+len(a) > right:
+        problems.append("REGION_NOT_UNIQUELY_MAPPED")
+    if problems:
+        detail["barriers"] = sorted(set(problems))
+        return detail
+    left += len(a)
+    if right-left >= cfg.deletion_min_length:
+        problems.append("COMPLEX_REGION_NOT_REASSESSED")
+    lo, hi = left-region["window_padding"], right+region["window_padding"]
+    if not 0 <= lo < hi <= len(sequence):
+        problems.append("REGION_OUTSIDE_POLISHED_SEQUENCE")
+        return detail
+    masked_positions, low, depths, fractions = [], [], [], []
+    for p in range(lo, hi):
+        if p in masked or sequence[p] not in DNA:
+            masked_positions.append(p)
+        counts = Counter(ev["pile"].get(p, {}).values())
+        depth = sum(counts.values())
+        fraction = counts[sequence[p]] / max(1, depth)
+        depths.append(depth)
+        fractions.append(fraction)
+        if depth < cfg.min_depth or fraction < cfg.consensus_fraction:
+            low.append(p)
+    detail.update(original_interval=region["original_interval"], polished_interval=[left, right],
+                  polished_window=[lo, hi], masked_positions=masked_positions, low_support_positions=low,
+                  minimum_depth=min(depths), minimum_reference_support=min(fractions))
+    if masked_positions:
+        problems.append("MASKED_AUDITED_REGION")
+    if low:
+        problems.append("INSUFFICIENT_LOCAL_SUPPORT")
+    after = {r.name: _local_sequence(r, left, right) for r in reads}
+    comparison = _compare_local_sequences(before, after, sequence[left:right], cfg)
+    detail["local_alleles"] = comparison
+    problems.extend(comparison["barriers"])
+    detail["barriers"] = sorted(set(problems))
+    if not problems:
+        detail["status"] = "RESOLVED"
+    return detail
+
+
 def capture_variation_evidence(reads, ref, interval, ev, cfg):
-    """Record blocking SNP evidence for later reassessment, without changing QC."""
+    """Preserve original blocking SNP/indel evidence without changing screening."""
     start, end = interval
     by_id = {r.name: r for r in reads}
-    record = dict(schema_version=1, settings_sha256=_digest_json(asdict(cfg)),
+    record = dict(schema_version=2, settings_sha256=_digest_json(asdict(cfg)),
                   reference_sha256=hashlib.sha256(ref.encode()).hexdigest(),
                   target_interval=list(interval), cohort=_read_cohort(reads), sites=[])
     for site in ev["sites"]:
@@ -708,6 +914,19 @@ def capture_variation_evidence(reads, ref, interval, ev, cfg):
         item = dict(kind=site["kind"], position_0based=pos, alleles=site["alleles"],
                     issues=[], supporting_bases=[])
         record["sites"].append(item)
+        if site["kind"] in ("I", "D"):
+            item.update(sequence=site["sequence"], minor_fraction=site["minor_fraction"],
+                        minor_count=site["minor_count"], minor_strand_counts=site["minor_strand_counts"],
+                        supporting_reads=[dict(read_id=rid, allele=allele, strand=by_id[rid].strand)
+                                          for rid, allele in sorted(site["calls"].items())])
+            event = (site["kind"], pos, site["sequence"])
+            for support in item["supporting_reads"]:
+                if support["allele"] == "ALT":
+                    flanks = _indel_query_flanks(by_id[support["read_id"]], event, ref)
+                    support["forward_query_flanks"] = flanks
+                    if not flanks:
+                        item["issues"].append("ORIGINAL_EVENT_NOT_TRACKABLE")
+            continue
         if site["kind"] != "SNP":
             item["issues"].append("UNSUPPORTED_SITE_TYPE")
             continue
@@ -740,17 +959,18 @@ def capture_variation_evidence(reads, ref, interval, ev, cfg):
             item["supporting_bases"].append(dict(read_id=rid, base=base, strand=read.strand,
                                                 forward_query_index=len(read.seq)-1-q if read.flag & 16 else q))
         item["issues"] = sorted(set(item["issues"]))
+    record["indel_regions"] = _capture_indel_regions(reads, ref, interval, record["sites"], cfg)
     return record
 
 
 def reassess_variation(screen_report, groups, reads, sequence, ev, masked, cfg):
-    """Resolve only fully observed original SNP flags; never clear other reasons."""
-    result = dict(schema_version=1, reason=VARIATION_REASON, status="NOT_APPLICABLE", barriers=[], sites=[])
+    """Reassess historical variation; preserve all other gates and consensus bases."""
+    result = dict(schema_version=2, reason=VARIATION_REASON, status="NOT_APPLICABLE", barriers=[], sites=[], regions=[])
     if VARIATION_REASON not in screen_report.get("reasons", []):
         return result
     result["status"] = "RETAINED"
     original = screen_report.get("variation_evidence")
-    if not original or original.get("schema_version") != 1:
+    if not original or original.get("schema_version") not in (1, 2):
         result["barriers"] = ["MISSING_OR_UNSUPPORTED_ORIGINAL_EVIDENCE"]
         return result
     barriers = result["barriers"]
@@ -780,12 +1000,68 @@ def reassess_variation(screen_report, groups, reads, sequence, ev, masked, cfg):
         return result
     by_id = {r.name: r for r in reads}
     mask = set(masked)
+    regions = {r["region_id"]: r for r in original.get("indel_regions", [])}
+    evaluated_regions = {}
     for site in sites:
         detail = dict(kind=site.get("kind"), original_position_0based=site.get("position_0based"),
                       original_alleles=site.get("alleles"), status="RETAINED",
                       barriers=list(site.get("issues", [])))
         result["sites"].append(detail)
         problems = detail["barriers"]
+        if site.get("kind") in ("I", "D"):
+            detail.update(original_sequence=site.get("sequence"),
+                          original_minor_fraction=site.get("minor_fraction"),
+                          original_minor_strand_counts=site.get("minor_strand_counts"),
+                          region_id=site.get("region_id"))
+            support = site.get("supporting_reads", [])
+            ids = [s["read_id"] for s in support]
+            if (not support or len(set(ids)) != len(ids) or not set(ids) <= by_id.keys()
+                    or dict(Counter(s["allele"] for s in support)) != site.get("alleles")):
+                problems.append("INCOMPLETE_ORIGINAL_SUPPORT")
+            if not site.get("sequence") or not set(site["sequence"]) <= DNA:
+                problems.append("MISSING_ORIGINAL_EVENT_SEQUENCE")
+            region_id = site.get("region_id")
+            if region_id not in regions:
+                problems.append("MISSING_ORIGINAL_INDEL_REGION")
+            elif not problems:
+                if region_id not in evaluated_regions:
+                    assessed = _reassess_indel_region(regions[region_id], reads, sequence, ev, mask, cfg)
+                    evaluated_regions[region_id] = assessed
+                    result["regions"].append(assessed)
+                assessed = evaluated_regions[region_id]
+                problems.extend(assessed["barriers"])
+                unobservable = set(assessed.get("local_alleles", {}).get("unobservable_read_ids", []))
+                missing = sorted(set(ids) & unobservable)
+                detail.update(original_support_reads=len(support), unevaluable_original_support=missing)
+                if missing:
+                    problems.append("ORIGINAL_SUPPORT_NOT_EVALUABLE")
+                # Changed local boundaries are charged to the alternative upper
+                # bound. Still require every original ALT's physical flanks to
+                # remain observable in this same local window after realignment.
+                tracked = []
+                lo, hi = assessed.get("polished_window", [0, 0])
+                for supporting in support:
+                    if supporting["allele"] != "ALT":
+                        continue
+                    read = by_id[supporting["read_id"]]
+                    flanks = supporting.get("forward_query_flanks", [])
+                    projections = []
+                    for q in flanks:
+                        if not 0 <= q < len(read.seq):
+                            continue
+                        query = len(read.seq)-1-q if read.flag & 16 else q
+                        projections.append(_project_query(read, query, sequence))
+                    tracked.append(dict(read_id=read.name, projections=projections))
+                    if len(projections) != 2 or any(
+                            p["kind"] not in ("MATCH", "MISMATCH", "INSERTION")
+                            or p.get("base_quality", -1) < cfg.min_baseq
+                            or not lo <= p.get("position_0based", -1) < hi for p in projections):
+                        problems.append("ORIGINAL_SUPPORT_NOT_EVALUABLE")
+                detail["tracked_event_flanks"] = tracked
+            detail["barriers"] = sorted(set(problems))
+            if not problems:
+                detail["status"] = "RESOLVED"
+            continue
         if site.get("kind") != "SNP":
             problems.append("UNSUPPORTED_SITE_TYPE")
         support = site.get("supporting_bases", [])

@@ -535,13 +535,16 @@ def cmd_polish(a):
         if sum(counts.values()) >= cfg.min_depth and counts["ALT"] / sum(counts.values()) >= cfg.consensus_fraction:
             fixed_indels.append(event)
 
-    # Numerical gates are recalculated below. A historical SNP flag is resolved
-    # only after the original reads, query bases and unmasked regions are checked.
+    # Historical variation is reassessed only with the original read cohort,
+    # trackable SNP bases / complete indel alleles and unmasked local support.
     variation_reassessment = reassess_variation(screen_report, groups, reads, seq, ev, masked, cfg)
     resolved_reasons = [VARIATION_REASON] if variation_reassessment["status"] == "RESOLVED" else []
     reassessed = {"LOW_SUPPORT", "LOW_TARGET_SUPPORT", "REVIEW_STRAND_SUPPORT", "REVIEW_INCOMPLETE_COVERAGE"}
     reasons = [r for r in screen_report.get("reasons", []) if r not in reassessed and r not in resolved_reasons]
     warnings = []
+    if any(s.get("kind") in ("I", "D") and s.get("status") == "RESOLVED"
+           for s in variation_reassessment["sites"]):
+        warnings.append("WARN_HISTORICAL_INDEL_REASSESSED")
     ambiguous_reference_reads = post_status.get("ambiguous_reference", 0)
     unresolved_for_qc = sum(post_status.values()) - len(reads) - ambiguous_reference_reads
     if ambiguous_reference_reads:
