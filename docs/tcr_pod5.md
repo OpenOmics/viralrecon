@@ -32,6 +32,12 @@ For PID201588, the expected constructs are **APC and PIK3CA**. The competitive p
 
 This branch bypasses ARTIC, Guppyplex, viral lineage analysis, and the old Cutadapt demultiplexer. It does not claim that a consensus or tree proves a well began with one physical molecule. Its interpretation is **no detectable mixture above the configured thresholds**.
 
+An optional downstream MAFFT/RAxML-NG analysis (`--tcr_phylogeny`) compares all
+available PASS and REVIEW consensus sequences with the cropped complete
+reference panel, separately for each batch. It preserves well decisions and
+adds alignment/tree sections to MultiQC. See [configuration, outputs and
+interpretation](tcr_phylogeny.md).
+
 ## 2. Installation and software
 
 Use the updated branch directly (do not reapply the old package installer):

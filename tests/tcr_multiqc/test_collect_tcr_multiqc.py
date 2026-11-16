@@ -69,8 +69,86 @@ class CollectorTests(unittest.TestCase):
     def build(self):
         r = Report(self.args)
         r.load(); r.overview(); r.inputs_and_basecalls(); r.demux_trim_assignment()
-        r.target_and_qc(); r.consensus(); r.audits(); r.completeness()
+        r.target_and_qc(); r.consensus(); r.phylogeny(); r.audits(); r.completeness()
         return r
+
+    def add_phylogeny(self, status="COMPLETE"):
+        folder = self.root / "batch_one/phylogeny"
+        put(folder / "phylogeny.json", dict(batch="batch_one", version="1.0.0", status=status,
+            reason="test reason", limitations="Exploratory; REVIEW remains unaccepted.",
+            counts=dict(PASS=1, REVIEW_POLISHED=1, REVIEW_UNPOLISHED=0, references=4,
+                        excluded_wells=1, review_without_sequence=0),
+            alignment=dict(tips=6, analyzed_columns=100, identical_tip_groups=[["tip1", "tip2"]]),
+            settings=dict(model="GTR+G", bootstraps=200, seed=17, threads=4, min_target_overlap=.85),
+            tool_versions=dict(mafft="TEST", raxml_ng="TEST"), tree=dict(bootstrap_trees=200) if status == "COMPLETE" else {}))
+        for filename, header, row in (
+            ("reference_crops.tsv", "reference\tstart\tend\tlength", "ref1\t512\t4136\t3624"),
+            ("sequence_metadata.tsv", "tip_id\tkind\tqc_reasons", "tip1\tREVIEW_POLISHED\tREJECT_LINKED_HAPLOTYPES"),
+            ("excluded_wells.tsv", "sample\tstatus\treason", "batch_one__A3\tNO_READS\tStatus excluded"),
+            ("alignment_metrics.tsv", "tip_id\tunambiguous_pct\tambiguous_pct\tgap_pct", "tip1\t90\t5\t5")):
+            (folder / filename).write_text(header + "\n" + row + "\n")
+        if status == "COMPLETE":
+            (folder / "tree.svg").write_text('<svg xmlns="http://www.w3.org/2000/svg"><text>TEST TREE</text></svg>')
+            for name in ("best_tree.nwk", "supported_tree.nwk"):
+                (folder / name).write_text("(tip1:0.1,tip2:0.1);\n")
+            for name in ("tree_input.fasta", "sequences_aligned.fasta"):
+                (folder / name).write_text(">tip1\nACGT\n")
+        return folder
+
+    def test_phylogeny_is_absent_when_not_requested(self):
+        r = self.build()
+        self.assertFalse(any(key.startswith(("tcr_17_", "tcr_18_")) for key in r.data))
+
+    def test_phylogeny_tables_plot_downloads_and_original_status(self):
+        self.add_phylogeny()
+        r = self.build()
+        self.assertEqual(r.data["tcr_17_selection"]["data"]["batch_one"]["references"], 4)
+        self.assertEqual(r.data["tcr_17_crops"]["data"]["batch_one / ref1"]["start"], 512)
+        self.assertEqual(r.data["tcr_17_batch_one_composition"]["data"]["tip1"]["Unambiguous bases"], 90.0)
+        page = r.data["tcr_18_batch_one_tree"]["data"]
+        self.assertIn("data:image/svg+xml;base64,", page)
+        self.assertIn('download="batch_one_supported_tree.nwk"', page)
+        self.assertEqual(r.data["tcr_10_final"]["data"]["batch_one / A2"]["status"], "REVIEW")
+        r.write()
+        self.assertTrue((Path(self.args.outdir) / "plots/batch_one_tree.svg").is_file())
+
+    def test_phylogeny_respects_batch_filter(self):
+        self.add_phylogeny()
+        self.args.batch = ["batch_two"]
+        r = self.build()
+        self.assertNotIn("tcr_17_selection", r.data)
+
+    def test_skipped_phylogeny_has_reason_and_no_fake_tree(self):
+        self.add_phylogeny(status="SKIPPED")
+        r = self.build()
+        self.assertEqual(r.data["tcr_18_settings"]["data"]["batch_one"]["status"], "SKIPPED")
+        page = r.data["tcr_18_batch_one_tree"]["data"]
+        self.assertIn("Tree not estimated: test reason", page)
+        self.assertNotIn("data:image", page)
+
+    def test_incomplete_completed_phylogeny_fails(self):
+        folder = self.add_phylogeny()
+        (folder / "supported_tree.nwk").unlink()
+        with self.assertRaisesRegex(ValueError, "Completed phylogeny is missing"):
+            self.build()
+
+    def test_display_alias_does_not_rewrite_source_decisions(self):
+        path = self.root / "batch_one/wells/A1/consensus/consensus_result/decision.json"
+        post = json.loads(path.read_text())
+        post["reasons"] = ["REJECT_LINKED_HAPLOTYPES", "REJECT_POSTPOLISH_LINKED_HAPLOTYPES"]
+        put(path, post)
+        before = path.read_bytes()
+        qc_path = self.root / "batch_one/wells/A1/heterogeneity/qc/decision.json"
+        qc = json.loads(qc_path.read_text())
+        qc["reasons"] = ["REJECT_LINKED_HAPLOTYPES"]
+        put(qc_path, qc)
+        r = self.build()
+        self.assertEqual(path.read_bytes(), before)
+        row = r.tables["tcr_09_polished"]["batch_one / A1"]
+        self.assertEqual(row["reasons"], "REJECT_LINKED_VARIANTS; REJECT_POSTPOLISH_LINKED_VARIANTS")
+        self.assertIn("Consensus outputs and sequences for review", r.data["tcr_10_final"]["parent_name"])
+        self.assertEqual(r.data["tcr_08_reasons"]["data"]["batch_one"]["REJECT_LINKED_VARIANTS"], 1)
+        self.assertNotIn("REJECT_LINKED_HAPLOTYPES", r.data["tcr_08_reasons"]["headers"])
 
     def test_full_counts_and_metric_stages(self):
         r = self.build()

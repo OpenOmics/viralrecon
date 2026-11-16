@@ -760,6 +760,45 @@
                 "tcr_input": {
                     "type": "string",
                     "description": "Batch-level POD5 manifest CSV; not a FASTQ samplesheet."
+                },
+                "tcr_phylogeny": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Optional per-batch MAFFT/RAxML-NG tree of cropped panel references and all available PASS/REVIEW consensus sequences."
+                },
+                "tcr_mafft_bin": {
+                    "type": "string",
+                    "default": "mafft",
+                    "description": "MAFFT executable or absolute path for the optional phylogeny."
+                },
+                "tcr_raxml_ng_bin": {
+                    "type": "string",
+                    "default": "raxml-ng",
+                    "description": "RAxML-NG executable or absolute path for the optional phylogeny."
+                },
+                "tcr_phylogeny_model": {
+                    "type": "string",
+                    "default": "GTR+G",
+                    "description": "Nucleotide substitution model for RAxML-NG, not a partition file."
+                },
+                "tcr_phylogeny_bootstraps": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "default": 200,
+                    "description": "Number of Felsenstein bootstrap replicates."
+                },
+                "tcr_phylogeny_seed": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "default": 17,
+                    "description": "RAxML-NG random seed; reproducibility also requires matching software and settings."
+                },
+                "tcr_phylogeny_min_target_overlap": {
+                    "type": "number",
+                    "exclusiveMinimum": 0,
+                    "maximum": 1,
+                    "default": 0.85,
+                    "description": "Minimum fraction of each supported inferred target retained in the common reference crop."
                 }
             }
         }

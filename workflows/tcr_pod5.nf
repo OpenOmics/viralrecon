@@ -7,6 +7,7 @@ include {
     TCR_DORADO_TRIM; TCR_ALIGN; TCR_INFER_TARGETS; TCR_WELL_QC; TCR_DORADO_POLISH; TCR_REPORT
 } from '../modules/local/tcr_pod5/main'
 include { TCR_MULTIQC } from '../modules/local/tcr_multiqc/main'
+include { TCR_PHYLOGENY } from '../modules/local/tcr_phylogeny/main'
 
 // Pass only the report inputs, never BAM/POD5 files or a published results tree.
 def tcrReportFiles(prefix, directory, names) {
@@ -134,6 +135,30 @@ workflow TCR_POD5 {
         tooling
     )
 
+    // A separate helper/channel keeps this optional analysis out of upstream task hashes.
+    ch_phylogeny = Channel.empty()
+    ch_phylogeny_reports = Channel.empty()
+    if (params.tcr_phylogeny) {
+        def phylogeny_tool = Channel.value(file("${projectDir}/bin/tcr_pod5_phylogeny.py", checkIfExists: true))
+        ch_phylogeny_input = TCR_PREPARE.out.scheme
+            .map { meta, scheme -> tuple(meta.id, meta, scheme.resolve('reference.fasta')) }
+            .join(TCR_INFER_TARGETS.out.result.map { meta, targets -> tuple(meta.id, targets.resolve('inferred_targets.json')) })
+            .map { batch, meta, refs, targets -> tuple(meta, refs, targets) }
+            .combine(TCR_REPORT.out.table)
+            .combine(TCR_REPORT.out.consensus)
+            .combine(TCR_REPORT.out.diagnostic_consensus)
+        TCR_PHYLOGENY(ch_phylogeny_input, phylogeny_tool)
+        ch_phylogeny = TCR_PHYLOGENY.out.result
+        ch_phylogeny_reports = ch_phylogeny.flatMap { meta, result ->
+            // SKIPPED analyses have metrics/reasons but deliberately no fabricated tree.
+            def names = ['phylogeny.json', 'sequence_metadata.tsv', 'reference_crops.tsv',
+                         'excluded_wells.tsv', 'alignment_metrics.tsv', 'tree.svg',
+                         'sequences_aligned.fasta', 'tree_input.fasta', 'best_tree.nwk', 'supported_tree.nwk']
+                .findAll { Files.isRegularFile(result.resolve(it)) }
+            tcrReportFiles("${meta.id}/phylogeny", result, names)
+        }
+    }
+
     ch_multiqc = Channel.empty()
     if (!params.skip_multiqc) {
         def report_tools = Channel.value(file("${projectDir}/assets/tcr_pod5/multiqc", checkIfExists: true))
@@ -171,6 +196,7 @@ workflow TCR_POD5 {
             .mix(TCR_REPORT.out.consensus.map { p -> tuple('summary/accepted_consensus.fasta', p) })
             .mix(TCR_REPORT.out.review_consensus.map { p -> tuple('summary/review_consensus.fasta', p) })
             .mix(TCR_REPORT.out.diagnostic_consensus.map { p -> tuple('summary/diagnostic_consensus.fasta', p) })
+            .mix(ch_phylogeny_reports)
             // collect waits for every source, including optional/empty polishing channels.
             .collect(flat: false)
             .map { rows ->
@@ -191,5 +217,6 @@ workflow TCR_POD5 {
     review_consensus = TCR_REPORT.out.review_consensus
     diagnostic_consensus = TCR_REPORT.out.diagnostic_consensus
     summary = TCR_REPORT.out.json
+    phylogeny = ch_phylogeny
     multiqc = ch_multiqc
 }

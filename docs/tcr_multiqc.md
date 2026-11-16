@@ -10,14 +10,22 @@ are unchanged.
 | Sections | Included by default | Purpose |
 |---|---|---|
 | 00–09 | Yes | Overview, input audit, preparation, basecalling, demultiplexing, trimming, assignment, target inference, well QC, and polishing. |
-| 10 | Yes | Final accepted and diagnostic consensus outputs, final decisions, FASTA counts, sequence lengths, and N masking. Polished diagnostics are a subset of all diagnostics. |
+| 10 | Yes | **Consensus outputs and sequences for review**: accepted and diagnostic outputs, final decisions, FASTA counts, sequence lengths, and N masking. Polished diagnostics are a subset of all diagnostics. |
 | 11 | Yes | Recorded QC settings, per-well availability, and consistency findings. |
 | 12–16 | No | Exploratory assignment, barcode-margin, read-end, splitting, and internal-junction comparisons. These remain available through the standalone collector. |
+| 17–18 | With `--tcr_phylogeny` | Cropped references, PASS/REVIEW sequence selection, MAFFT alignment metrics and composition, RAxML-NG tree/bootstraps, versions and embedded downloads. See [tcr_phylogeny.md](tcr_phylogeny.md). |
 
 The module passes `--no-discover-audits` and supplies no audit paths. It never
 runs those exploratory analyses. Production assignment/deletion statistics
 remain in section 06. Diagnostic sequences in section 10 remain explicitly
 separate from accepted consensus sequences.
+
+Reason labels in MultiQC tables use `REJECT_LINKED_VARIANTS` and
+`REJECT_POSTPOLISH_LINKED_VARIANTS`. These are presentation aliases for the
+historical `*_LINKED_HAPLOTYPES` codes; source decision JSON, the pipeline's
+well-summary TSV, and classifications are unchanged. Linked variant evidence
+does not by itself prove a number of original physical templates. Report tables
+export the displayed labels. The section 08 reason-count columns use the same aliases.
 
 ## Inputs, execution, and outputs
 

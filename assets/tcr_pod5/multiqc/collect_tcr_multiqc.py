@@ -21,7 +21,7 @@ from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.0.3"
+VERSION = "1.1.0"
 GROUPS = {
     "00": "Overview across steps",
     "01": "POD5 input audit",
@@ -33,15 +33,18 @@ GROUPS = {
     "07": "Batch target inference",
     "08": "Per-well mixture and consensus screening",
     "09": "Dorado polishing and final validation",
-    "10": "Diagnostic consensus and delivered sequences",
+    "10": "Consensus outputs and sequences for review",
     "11": "Recorded settings and report completeness",
     "12": "Exploratory: assignment comparison",
     "13": "Exploratory: barcode margin comparison",
     "14": "Exploratory: read-end audit",
     "15": "Exploratory: parent-tracked splitting comparison",
     "16": "Exploratory: internal primer junctions",
+    "17": "Exploratory: phylogeny inputs and alignment",
+    "18": "Exploratory: maximum-likelihood trees",
 }
 LABELS = {
+    "linked_haplotype_groups": "Linked variant pattern pairs",
     "raw_assigned_reads": "Raw assigned reads", "trim_pass": "Trimmed reads",
     "usable_reads": "Assigned to panel (pre-polish)", "selected_reads": "Selected reads (pre-polish)",
     "plus": "+ strand reads", "minus": "− strand reads", "callable_pct": "Callable % (pre-polish)",
@@ -139,6 +142,14 @@ def yaml_lines(value, depth=0):
                 yield from yaml_lines(val, depth + 2)
             else:
                 yield pad + "- " + json.dumps(val, ensure_ascii=False, allow_nan=False)
+
+
+def display_reason(value):
+    """Presentation aliases only: stored decision codes and classifications stay intact."""
+    if not isinstance(value, str):
+        return value
+    return re.sub(r"\bREJECT_(POSTPOLISH_)?LINKED_HAPLOTYPES\b",
+                  lambda match: "REJECT_" + (match.group(1) or "") + "LINKED_VARIANTS", value)
 
 
 def clean(row):
@@ -260,7 +271,8 @@ class Report:
         if group not in self.group_descriptions and description:
             self.group_descriptions[group] = description
         if kind != "html":
-            rows = {k: v for k, v in rows.items() if any(x is not None for x in v.values())}
+            rows = {k: {name: display_reason(value) for name, value in v.items()}
+                    for k, v in rows.items() if any(x is not None for x in v.values())}
         if not rows:
             rows = {"Not available": {"availability": "No matching output was found."}}
             kind = "table"
@@ -696,7 +708,7 @@ class Report:
             if q.get("callable_fraction") is not None:
                 callable_rows[key] = {"Callable": pct(q["callable_fraction"]), "Not callable": pct(1 - q["callable_fraction"])}
             blockers[key] = {"polish_eligible": q.get("polish_eligible"), "polish_blockers": "; ".join(q.get("polish_blockers", []))}
-            for reason in set(q.get("reasons", [])):
+            for reason in {display_reason(value) for value in q.get("reasons", [])}:
                 row = reasons.setdefault(w["batch"], Counter())
                 row[reason] += 1
         self.add("08", "qc", "Pre-polish screening", qc_rows,
@@ -770,8 +782,10 @@ class Report:
         self.add("09", "polished", "Post-polish validation", polished,
                  "Realigns selected reads to a draft, runs Dorado polish, realigns again and repeats the QC checks. "
                  "Low-depth, low-support and problematic positions are masked. Persistent biological blockers remain relevant. "
-                 "An earlier SNP variation flag can resolve only when the original reads and supporting bases remain evaluable, "
+                 "An earlier variation flag can resolve only when the original reads and supporting bases remain evaluable, "
                  "every affected region is uniquely mapped and unmasked with sufficient support, and blocking variation is absent. "
+                 "From v0.4.2, historical indel reassessment compares complete local alleles in a shared callable read population; "
+                 "original event counts remain available for auditing. "
                  "From v0.4.1, the post-polish split-read flag also requires both alert thresholds, using all read IDs evaluated in this realignment. "
                  "Split reads remain excluded from consensus and included in unresolved_for_qc. "
                  "The table uses the final polishing decision; per-well overview callability remains explicitly pre-polish."
@@ -781,7 +795,10 @@ class Report:
                  "The final report prefers a polished diagnostic over an eligible unpolished draft and exports at most one diagnostic per well. "
                  "REJECT wells do not contribute. Diagnostic eligibility is not an accepted assay call."
                  + self.filters(["diagnostic_min_reads", "diagnostic_min_strand_reads", "diagnostic_min_depth", "min_baseq", "consensus_fraction", "diagnostic_min_callable_fraction"]))
-        self.add("10", "final", "Final decisions and reasons", final)
+        self.add("10", "final", "Final decisions and reasons", final,
+                 "REJECT_LINKED_VARIANTS (and its POSTPOLISH counterpart) is the display name for the stored "
+                 "REJECT_LINKED_HAPLOTYPES reason. It describes linked variant evidence, without asserting a proven number "
+                 "of physical templates. This presentation change does not alter decisions or machine-readable source codes.")
         run_rows = {}
         if self.run:
             run_rows["Whole run (all batches)"] = {k: self.run.get(k) for k in ("wells", "accepted_consensuses", "diagnostic_consensuses", "review_consensuses", "implementation_version")}
@@ -816,6 +833,92 @@ class Report:
         if seqrows:
             self.add("10", "sequence_metrics", "Delivered sequence lengths and masking", seqrows,
                      "Polished diagnostic subset rows also appear in the all-diagnostic set; these rows are deliberately labelled and are not additive.")
+
+    def phylogeny(self):
+        """Only completed optional task outputs; absence means not requested."""
+        selection, crops, tips, excluded, alignments, trees, versions, counts = {}, {}, {}, {}, {}, {}, {}, {}
+        for batch in self.batches:
+            directory = self.root / batch / "phylogeny"
+            report = self.read_json(directory / "phylogeny.json")
+            if report is None:
+                continue
+            if report.get("batch") != batch or report.get("status") not in ("COMPLETE", "SKIPPED"):
+                raise ValueError(f"Invalid phylogeny report for {batch}")
+            c, a, settings = report["counts"], report["alignment"], report["settings"]
+            selection[batch] = dict(status=report["status"], reason=report["reason"], **c)
+            counts[batch] = {key: c[key] for key in ("PASS", "REVIEW_POLISHED", "REVIEW_UNPOLISHED", "references")}
+            alignments[batch] = dict(status=report["status"], **{key: value for key, value in a.items() if key != "identical_tip_groups"})
+            alignments[batch]["identical_tip_groups"] = len(a["identical_tip_groups"]) if "identical_tip_groups" in a else None
+            trees[batch] = dict(status=report["status"], reason=report["reason"], **settings, **report["tree"])
+            versions[batch] = report["tool_versions"]
+            for filename, index, destination in (("reference_crops.tsv", "reference", crops),
+                                                  ("sequence_metadata.tsv", "tip_id", tips),
+                                                  ("excluded_wells.tsv", "sample", excluded)):
+                path = directory / filename
+                if not path.is_file():
+                    raise ValueError(f"Missing phylogeny output: {path}")
+                for row in self.tsv(path):
+                    key = f"{batch} / {row.pop(index)}"
+                    destination[key] = {key: scalar(value) for key, value in row.items()}
+            alignment_path = directory / "alignment_metrics.tsv"
+            if not alignment_path.is_file():
+                raise ValueError(f"Missing phylogeny output: {alignment_path}")
+            alignment_rows = self.tsv(alignment_path)
+            composition = {row["tip_id"]: {"Unambiguous bases": row["unambiguous_pct"],
+                           "Ambiguous / N": row["ambiguous_pct"], "Alignment gaps": row["gap_pct"]}
+                           for row in alignment_rows}
+            composition = {tip: {key: float(value) for key, value in row.items()} for tip, row in composition.items()}
+            if composition:
+                self.add("17", batch + "_composition", batch + ": aligned sequence composition", composition,
+                         "Percentages refer to the full MAFFT alignment, including invariant columns. Gaps may represent "
+                         "real deletions or uncovered termini; this plot does not distinguish these causes.", kind="bargraph", ylab="Alignment columns (%)")
+            links = []
+            for name in ("sequences_aligned.fasta", "tree_input.fasta", "best_tree.nwk", "supported_tree.nwk"):
+                path = directory / name
+                if path.is_file():
+                    self.track(path)
+                    payload = base64.b64encode(path.read_bytes()).decode()
+                    links.append(f'<a download="{html.escape(batch)}_{name}" href="data:text/plain;base64,{payload}">{name}</a>')
+            if report["status"] == "COMPLETE":
+                for name in ("tree.svg", "supported_tree.nwk", "best_tree.nwk", "tree_input.fasta"):
+                    if not (directory / name).is_file():
+                        raise ValueError(f"Completed phylogeny is missing {batch}/{name}")
+                self.track(directory / "tree.svg")
+                svg = (directory / "tree.svg").read_text()
+                self.plot_assets[f"{batch}_tree.svg"] = svg
+                image = base64.b64encode(svg.encode()).decode()
+                picture = f'<img alt="{html.escape(batch)} exploratory tree" style="max-width:100%;height:auto" src="data:image/svg+xml;base64,{image}"/>'
+            else:
+                picture = "<p>Tree not estimated: " + html.escape(report["reason"]) + "</p>"
+            self.add("18", batch + "_tree", batch + ": exploratory tree", picture + "<p>" + " · ".join(links) + "</p>",
+                     html.escape(report["limitations"]), kind="html")
+        if not selection:
+            return
+        self.add("00", "phylogeny", "Optional phylogeny summary", selection,
+                 "One exploratory analysis per batch. Counts describe available input sequences; a SKIPPED analysis has no inferred tree.")
+        self.add("17", "selection", "Sequence selection", selection,
+                 "Includes every final PASS consensus and every available REVIEW diagnostic consensus once, preferring the "
+                 "already selected polished diagnostic over an unpolished draft. REJECT/NO_READS wells and REVIEW wells "
+                 "without a sequence are listed separately. No additional consensus quality threshold is applied here.")
+        self.add("17", "counts", "Available sequence counts", counts, kind="bargraph", ylab="Sequences")
+        self.add("17", "crops", "Reference crop coordinates", crops,
+                 "The full reference panel is aligned with MAFFT. Supported, consensus-eligible inferred targets define a common "
+                 "homologous span; that span is projected onto every reference, including references without their own read support. "
+                 "Coordinates are 0-based, end-exclusive. Each donor must retain at least the configured fraction (default 0.85) "
+                 "of its inferred span. No full-vector fallback is used. Projected boundaries are not independently validated PCR endpoints.")
+        self.add("17", "tips", "Included sequences and original well reasons", tips)
+        if excluded:
+            self.add("17", "excluded", "Wells without an included sequence", excluded)
+        self.add("17", "alignment", "MAFFT alignment statistics", alignments,
+                 "MAFFT --auto --threadit 0 aligns cropped references and delivered consensus sequences. Original sequence content "
+                 "and N masks are verified after alignment. Only globally undetermined N/gap columns are removed for RAxML-NG; "
+                 "invariant columns are retained. Variable/informative counts use unambiguous A/C/G/T observations. Identical tips are retained.")
+        self.add("18", "settings", "Tree inference and bootstrap support", trees,
+                 "RAxML-NG performs maximum-likelihood search and Felsenstein bootstrapping (defaults: GTR+G, 200 replicates, seed 17). "
+                 "A tree is skipped when fewer than four distinguishable sequences or no parsimony-informative nucleotide sites "
+                 "are available, or requested tips/crops are not evaluable. Tool errors remain pipeline errors. Bootstrap support "
+                 "is not the probability that a well is single-template; branches below 70% are counted descriptively, not filtered.")
+        self.add("18", "versions", "Recorded software versions", versions)
 
     def audits(self):
         paths = {Path(p).expanduser().resolve() for p in self.args.audit_dir}
@@ -984,6 +1087,7 @@ def main():
         r.demux_trim_assignment()
         r.target_and_qc()
         r.consensus()
+        r.phylogeny()
         r.audits()
         r.completeness()
         r.write()

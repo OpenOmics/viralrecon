@@ -1,0 +1,10 @@
+name: viralrecon-tcr-phylogeny
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - python=3.11
+  - mafft=7.526
+  - raxml-ng=1.2.2
+  - biopython=1.85
+  - matplotlib-base=3.10.3
