@@ -30,7 +30,7 @@ process TCR_POD5_AUDIT {
 process TCR_PREPARE {
     tag "${meta.id}"
     label 'tcr_cpu'
-    publishDir { "${params.outdir}/tcr_pod5/${meta.id}/scheme" }, mode: 'copy', pattern: 'scheme'
+    publishDir path: { "${params.outdir}/tcr_pod5/${meta.id}/scheme" }, mode: 'copy', pattern: 'scheme'
     input:
     tuple val(meta), path(primers), path(refs)
     path tooling
@@ -49,7 +49,7 @@ process TCR_PREPARE {
 process TCR_DORADO_BASECALL {
     tag "${meta.id}"
     label 'tcr_gpu'
-    publishDir { "${params.outdir}/tcr_pod5/${meta.id}/basecalling" }, mode: 'copy',
+    publishDir path: { "${params.outdir}/tcr_pod5/${meta.id}/basecalling" }, mode: 'copy',
         saveAs: { name -> name == 'calls.bam' && !params.tcr_save_basecalls ? null : name }
     input:
     tuple val(meta), path(pod5s, stageAs: 'pod5_input??/*'), path(model)
@@ -75,7 +75,7 @@ process TCR_DORADO_BASECALL {
 process TCR_DORADO_DEMUX {
     tag "${meta.id}"
     label 'tcr_cpu'
-    publishDir { "${params.outdir}/tcr_pod5/${meta.id}/demultiplexing" }, mode: 'copy', pattern: 'demux'
+    publishDir path: { "${params.outdir}/tcr_pod5/${meta.id}/demultiplexing" }, mode: 'copy', pattern: 'demux'
     input:
     tuple val(meta), path(scheme), path(bam)
     path tooling
@@ -91,7 +91,7 @@ process TCR_DORADO_DEMUX {
 process TCR_DORADO_TRIM {
     tag "${meta.id}"
     label 'tcr_cpu'
-    publishDir { "${params.outdir}/tcr_pod5/${meta.batch}/wells/${meta.well}/trimming" }, mode: 'copy',
+    publishDir path: { "${params.outdir}/tcr_pod5/${meta.batch}/wells/${meta.well}/trimming" }, mode: 'copy',
         pattern: '*.{bam,gz,json,tsv,log}'
     input:
     tuple val(meta), path(bam), path(primers), path(refs)
@@ -114,7 +114,7 @@ process TCR_DORADO_TRIM {
 process TCR_ALIGN {
     tag "${meta.id}"
     label 'tcr_cpu'
-    publishDir { "${params.outdir}/tcr_pod5/${meta.batch}/wells/${meta.well}/alignment" }, mode: 'copy',
+    publishDir path: { "${params.outdir}/tcr_pod5/${meta.batch}/wells/${meta.well}/alignment" }, mode: 'copy',
         pattern: 'aligned*'
     input:
     tuple val(meta), path(clean), path(trim_stats), path(refs)
@@ -134,7 +134,7 @@ process TCR_ALIGN {
 process TCR_INFER_TARGETS {
     tag "${meta.id}"
     label 'tcr_cpu'
-    publishDir { "${params.outdir}/tcr_pod5/${meta.id}/target_inference" }, mode: 'copy', pattern: 'targets'
+    publishDir path: { "${params.outdir}/tcr_pod5/${meta.id}/target_inference" }, mode: 'copy', pattern: 'targets'
     input:
     tuple val(meta), path(scheme), val(wells), path(bams, stageAs: 'well_bams??/*')
     path settings
@@ -158,7 +158,7 @@ process TCR_INFER_TARGETS {
 process TCR_WELL_QC {
     tag "${meta.id}"
     label 'tcr_cpu'
-    publishDir { "${params.outdir}/tcr_pod5/${meta.batch}/wells/${meta.well}/heterogeneity" }, mode: 'copy', pattern: 'qc'
+    publishDir path: { "${params.outdir}/tcr_pod5/${meta.batch}/wells/${meta.well}/heterogeneity" }, mode: 'copy', pattern: 'qc'
     input:
     tuple val(meta), path(bam), path(refs), path(trim_stats), path(clean), path(targets)
     path settings
@@ -179,7 +179,7 @@ process TCR_WELL_QC {
 process TCR_DORADO_POLISH {
     tag "${meta.id}"
     label 'tcr_polish'
-    publishDir { "${params.outdir}/tcr_pod5/${meta.batch}/wells/${meta.well}/consensus" }, mode: 'copy'
+    publishDir path: { "${params.outdir}/tcr_pod5/${meta.batch}/wells/${meta.well}/consensus" }, mode: 'copy'
     input:
     tuple val(meta), path(passed), path(clean)
     path models

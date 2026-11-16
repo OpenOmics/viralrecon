@@ -5,7 +5,7 @@ process TCR_PHYLOGENY {
     tag "${meta.id}"
     label 'tcr_phylogeny'
     conda "${moduleDir}/environment.yml"
-    publishDir { "${params.outdir}/tcr_pod5/${meta.id}" }, mode: 'copy', pattern: 'phylogeny'
+    publishDir path: { "${params.outdir}/tcr_pod5/${meta.id}" }, mode: 'copy', pattern: 'phylogeny'
 
     input:
     tuple val(meta), path(refs, stageAs: 'reference.fasta'), path(targets, stageAs: 'inferred_targets.json'),
