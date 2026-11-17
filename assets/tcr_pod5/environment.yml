@@ -1,0 +1,12 @@
+name: viralrecon-tcr-pod5
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - python=3.11
+  - samtools=1.21
+  - pip
+  - pip:
+      - pod5==0.3.28
+# Install Dorado 2.1.2 separately from the official ONT distribution.
+# Supply its absolute executable path through --tcr_dorado_bin.
